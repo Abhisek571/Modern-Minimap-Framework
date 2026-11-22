@@ -13,6 +13,9 @@ namespace MM::Bake
 
 	// kDataLoaded: with [Bake] bStartOnLoad set in the ini, starts (or resumes) the bake by itself once a game is
 	// loaded and the player has stood in the world for a while. For players without SKSE Menu Framework.
+	// False in Skyrim VR: the bake drives the flat free camera and copies the flat screen image.
+	inline bool Supported() { return !REL::Module::IsVR(); }
+
 	void StartOnLoadIfRequested();
 
 	// Any thread (settings page): the work runs on the main thread.
@@ -34,6 +37,7 @@ namespace MM::Bake
 		std::string phase;
 		std::string tone;
 		std::string message;
+		std::string state;  // for the status file: "starting", "done", "cancelled", "error"; empty = running / writing
 	};
 	Status GetStatus();
 }

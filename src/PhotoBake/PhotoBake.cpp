@@ -2,6 +2,7 @@
 
 #include "PhotoBake.h"
 
+#include "BakePlan.h"
 #include "PhotoProcessing.h"
 #include "TerrainMesh.h"
 #include "Hooks.h"
@@ -32,24 +33,28 @@ namespace MM::Bake
 		using Microsoft::WRL::ComPtr;
 
 		// Waits found while baking the included photos. Each one is there because skipping it crashed the engine at some point.
-		constexpr float kJumpCells = 3.0f;      // a move longer than this many cells counts as a long jump
-		constexpr float kJumpWait = 12.0f;      // before and after a long jump: let the high camera's LOD queue drain
+		constexpr float kJumpCells = 3.0f;      // a move longer than this many cells counts as a long jump (2x2 grid; scales with the grid)
+		constexpr float kJumpWait = 12.0f;      // before a long jump: let the high camera's LOD queue drain
 		constexpr float kCameraTimeout = 20.0f; // most extra seconds to wait for the camera to reach a shot before skipping it
 		constexpr float kDrainWait = 12.0f;     // before changing worldspace (BGSQueuedTerrainInitialLoad crash)
 		constexpr float kLoadMinWait = 6.0f;    // after MoveTo, before checking that the new area is loaded
 		constexpr float kWorldSettle = 15.0f;   // after entering a worldspace
 		constexpr float kFogWait = 8.0f;        // camera up, before the first fog test picture
 		constexpr float kFogToggleWait = 2.0f;  // after tfog, before the second picture
-		constexpr float kLoadTimeout = 600.0f;
+		constexpr float kLoadTimeout = 240.0f;  // unpaused seconds before a spot that never loads is skipped
 		constexpr float kCaptureTimeout = 15.0f;
+		constexpr float kFlatContrast = 15.0f;  // centre luma deviation below this: a flat, fogged-out photo (normal ones are 40+)
 		constexpr float kPlayerAboveGround = 300.0f;
 		constexpr int   kHudFrames = 3;         // frames between hiding the HUD and copying the picture
 		constexpr int   kFitShots = 30;         // photos sampled for the colour match
-		constexpr int   kRefSize = 128;         // reference render of one 2x2 block (64 px per cell)
 		constexpr float kCityMinRadius = 9000.0f;
 
 		constexpr auto kTileDir = "Data/textures/ModernMinimap/tamriel";
 		constexpr auto kProgressPath = "Data/SKSE/Plugins/ModernMinimapBake.txt";
+		// Read by the Modern Minimap Photo Baker app, which starts the game with bStartOnLoad and watches the bake.
+		constexpr auto kStatusPath = "Data/SKSE/Plugins/ModernMinimapBakeStatus.json";
+		constexpr auto kCancelPath = "Data/SKSE/Plugins/ModernMinimapBake.cancel";  // created by the app's Cancel button
+		constexpr auto kMenuCell = "WhiterunOrigin";  // bEnterFromMainMenu: coc target, next to the first shots
 		constexpr auto kRootWorld = "Tamriel";
 		// Walled cities: own worldspaces sharing Tamriel's coordinates. Tamriel shows only sky inside their walls,
 		// so their photos are taken in the city worldspace and stored as Tamriel tiles. Sorted.
@@ -110,14 +115,14 @@ namespace MM::Bake
 		struct Shot
 		{
 			std::string                      world;
-			int                              bx{ 0 }, by{ 0 };  // south-west cell of the 2x2 block
-			float                            x{ 0 }, y{ 0 };    // block centre = shared corner of its 4 cells
+			int                              bx{ 0 }, by{ 0 };  // south-west cell of the block (photo grid x grid cells)
+			float                            x{ 0 }, y{ 0 };    // block centre
 			float                            ground{ 0 };
 			std::vector<std::pair<int, int>> cells;             // cells this photo writes
 			bool                             done{ false };
 		};
 
-		std::string ShotKey(const std::string& a_world, int a_bx, int a_by) { return std::format("{} {} {}", a_world, a_bx, a_by); }
+		using BakePlan::ShotKey;
 
 		// Marker type -> radius (world units) whose cells get photographed.
 		float RadiusFor(int a_type)
@@ -173,21 +178,6 @@ namespace MM::Bake
 			}
 		}
 
-		// 2x2 blocks aligned to even cell numbers, north to south, serpentine so moves stay short.
-		std::vector<std::pair<int, int>> Blocks(const std::set<std::pair<int, int>>& a_cells)
-		{
-			std::set<std::pair<int, int>> set;
-			for (const auto& [cx, cy] : a_cells)
-				set.insert({ FloorDiv(cx, 2) * 2, FloorDiv(cy, 2) * 2 });
-			std::vector<std::pair<int, int>> out(set.begin(), set.end());
-			const auto key = [](const std::pair<int, int>& a_b) {
-				const int row = -a_b.second / 2;
-				return std::pair{ -a_b.second, ((row % 2) + 2) % 2 == 0 ? a_b.first : -a_b.first };
-			};
-			std::ranges::sort(out, [&](const auto& a, const auto& b) { return key(a) < key(b); });
-			return out;
-		}
-
 		bool IsCityWorld(const std::string& a_world)
 		{
 			return std::ranges::any_of(kCityWorlds, [&](const char* w) { return a_world == w; });
@@ -233,7 +223,7 @@ namespace MM::Bake
 			return out;
 		}
 
-		std::vector<Shot> BuildShots(const std::vector<Marker>& a_markers)
+		std::vector<Shot> BuildShots(const std::vector<Marker>& a_markers, int a_grid)
 		{
 			std::map<std::string, std::set<std::pair<int, int>>> city;
 			std::set<std::pair<int, int>>                        tam;
@@ -254,24 +244,24 @@ namespace MM::Bake
                 s.world = a_world;
                 s.bx = a_bx;
                 s.by = a_by;
-                s.x = (a_bx + 1) * kCellUnits;
-                s.y = (a_by + 1) * kCellUnits;
-                for (int dy = 0; dy < BakeImage::kBlockCells; ++dy)
-                    for (int dx = 0; dx < BakeImage::kBlockCells; ++dx)
+                s.x = BakePlan::BlockCentre(a_bx, a_grid);
+                s.y = BakePlan::BlockCentre(a_by, a_grid);
+                for (int dy = 0; dy < a_grid; ++dy)
+                    for (int dx = 0; dx < a_grid; ++dx)
                         if (a_world != kRootWorld || !cityCells.contains({ a_bx + dx, a_by + dy }))
                             s.cells.push_back({ a_bx + dx, a_by + dy });
                 if (!s.cells.empty())
                     shots.push_back(std::move(s));
 			};
 			for (const auto& [world, cells] : city) {
-				for (const auto& [bx, by] : Blocks(cells)) {
+				for (const auto& [bx, by] : BakePlan::Blocks(cells, a_grid)) {
 					add(world, bx, by);
-					for (int dy = 0; dy < BakeImage::kBlockCells; ++dy)
-						for (int dx = 0; dx < BakeImage::kBlockCells; ++dx)
+					for (int dy = 0; dy < a_grid; ++dy)
+						for (int dx = 0; dx < a_grid; ++dx)
 							cityCells.insert({ bx + dx, by + dy });
 				}
 			}
-			for (const auto& [bx, by] : Blocks(tam))
+			for (const auto& [bx, by] : BakePlan::Blocks(tam, a_grid))
 				add(kRootWorld, bx, by);
 			return shots;
 		}
@@ -317,40 +307,22 @@ namespace MM::Bake
 
 		// ---------------------------------------------------------------- progress file
 
-		struct Progress
-		{
-			bool                  toneKnown{ false };
-			BakeImage::Tone       tone;
-			std::set<std::string> done;
-		};
+		using Progress = BakePlan::Progress;
 
-		Progress LoadProgress()
+		Progress LoadProgress(int a_grid)
 		{
-			Progress      p;
 			std::ifstream in(kProgressPath);
-			std::string   line;
-			while (std::getline(in, line)) {
-				std::istringstream s(line);
-				std::string        what;
-				s >> what;
-				if (what == "tone") {
-					std::string kind;
-					s >> kind;
-					p.toneKnown = true;
-					p.tone.fitted = kind == "fit";
-				} else if (what == "lut") {
-					for (auto& v : p.tone.lut)
-						s >> v;
-				} else if (what == "gain") {
-					s >> p.tone.gain[0] >> p.tone.gain[1] >> p.tone.gain[2];
-				} else if (what == "done") {
-					std::string world;
-					int         bx = 0, by = 0;
-					if (s >> world >> bx >> by)
-						p.done.insert(ShotKey(world, bx, by));
-				}
-			}
-			return p;
+			return BakePlan::ParseProgress(in, a_grid);
+		}
+
+		std::string GridName(int a_grid) { return std::format("{}x{}", a_grid, a_grid); }
+
+		// Said when earlier progress was for another photo grid and is not used.
+		std::string DroppedGridNote(const Progress& a_p)
+		{
+			if (a_p.droppedGrid <= 0)
+				return {};
+			return std::format("Earlier progress was for the {} photo grid, not {}: those photos are baked again.", GridName(a_p.droppedGrid), GridName(a_p.grid));
 		}
 
 		void SaveProgress(const Progress& a_p)
@@ -362,16 +334,7 @@ namespace MM::Bake
 				std::ofstream out(tmp, std::ios::trunc);
 				if (!out)
 					return;
-				out << "# Modern Minimap town photo bake progress. Delete it (or press Reset) to bake everything again.\n";
-				if (a_p.toneKnown) {
-					out << "tone " << (a_p.tone.fitted ? "fit" : "grade") << "\n";
-					out << "lut";
-					for (const float v : a_p.tone.lut)
-						out << ' ' << v;
-					out << "\ngain " << a_p.tone.gain[0] << ' ' << a_p.tone.gain[1] << ' ' << a_p.tone.gain[2] << "\n";
-				}
-				for (const auto& key : a_p.done)
-					out << "done " << key << "\n";
+				BakePlan::WriteProgress(out, a_p);
 			}
 			fs::rename(tmp, kProgressPath, ec);
 			if (ec)
@@ -402,9 +365,11 @@ namespace MM::Bake
 		// Reference: the minimap's own LOD look for one block, rendered with the minimap renderer and read back.
 		struct RefRequest
 		{
-			TileDraw                                tile;
-			ComPtr<ID3D11ShaderResourceView>        keepDiffuse, keepNormal, keepWater;
-			Vec2                                    centre;
+			std::vector<TileDraw>                         tiles;
+			std::vector<ComPtr<ID3D11ShaderResourceView>> keep;  // holds the tiles' views until the render is done
+			Vec2                                          centre;
+			int                                           size{ 0 };  // render side, px (BakeImage::ReferenceSize)
+			int                                           grid{ BakePlan::kDefaultGrid };
 			ShadeParams                             shade;
 			std::promise<std::vector<std::uint8_t>> result;
 		};
@@ -412,6 +377,7 @@ namespace MM::Bake
 		std::shared_ptr<RefRequest> refQueued;   // waiting for the render thread
 		std::shared_ptr<RefRequest> refInFlight;  // render thread only
 		ComPtr<ID3D11Texture2D>     refStaging;   // render thread only
+		int                         refStagingSize = 0;  // render thread only
 		MapRenderer*                refRenderer = nullptr;  // render thread only; left alive at exit on purpose
 		bool                        refRendererFailed = false;
 		D3DStateBlock               refState;
@@ -507,9 +473,11 @@ namespace MM::Bake
 					return;
 				std::vector<std::uint8_t> rgba;
 				if (SUCCEEDED(hr)) {
-					rgba.resize(static_cast<std::size_t>(kRefSize) * kRefSize * 4);
-					for (int y = 0; y < kRefSize; ++y)
-						std::memcpy(rgba.data() + static_cast<std::size_t>(y) * kRefSize * 4, static_cast<const std::uint8_t*>(m.pData) + static_cast<std::size_t>(m.RowPitch) * y, kRefSize * 4);
+					const int size = refInFlight->size;
+					rgba.resize(static_cast<std::size_t>(size) * size * 4);
+					for (int y = 0; y < size; ++y)
+						std::memcpy(rgba.data() + static_cast<std::size_t>(y) * size * 4, static_cast<const std::uint8_t*>(m.pData) + static_cast<std::size_t>(m.RowPitch) * y,
+							static_cast<std::size_t>(size) * 4);
 					a_ctx->Unmap(refStaging.Get(), 0);
 				}
 				refInFlight->result.set_value(std::move(rgba));
@@ -531,9 +499,11 @@ namespace MM::Bake
 					refRendererFailed = true;
 				}
 			}
+			if (refStaging && refStagingSize != req->size)
+				refStaging.Reset();  // another photo grid than the last bake this session
 			if (!refStaging && !refRendererFailed) {
 				D3D11_TEXTURE2D_DESC s{};
-				s.Width = s.Height = kRefSize;
+				s.Width = s.Height = static_cast<UINT>(req->size);
 				s.MipLevels = s.ArraySize = 1;
 				s.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // the compose target's format
 				s.SampleDesc.Count = 1;
@@ -541,15 +511,16 @@ namespace MM::Bake
 				s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 				if (FAILED(a_dev->CreateTexture2D(&s, nullptr, &refStaging)))
 					refRendererFailed = true;
+				else
+					refStagingSize = req->size;
 			}
 			if (refRendererFailed) {
 				req->result.set_value({});
 				return;
 			}
 			refState.Backup(a_ctx);
-			const TileDraw draws[]{ req->tile };
-			refRenderer->Compose(a_ctx, { req->centre, BakeImage::kBlockCells * kCellUnits / kRefSize, kRefSize, req->shade }, draws);
-			const bool ok = refRenderer->ComposeTexture() && refRenderer->ComposeSize() == kRefSize;
+			refRenderer->Compose(a_ctx, { req->centre, req->grid * kCellUnits / static_cast<float>(req->size), req->size, req->shade }, req->tiles);
+			const bool ok = refRenderer->ComposeTexture() && refRenderer->ComposeSize() == req->size;
 			if (ok)
 				a_ctx->CopyResource(refStaging.Get(), refRenderer->ComposeTexture());
 			refState.Restore(a_ctx);
@@ -566,6 +537,7 @@ namespace MM::Bake
 			Progress      progress;
 			ID3D11Device* device{ nullptr };
 			ShadeParams   shade;
+			int           grid{ BakePlan::kDefaultGrid };
 		};
 		struct ContrastJob
 		{
@@ -578,6 +550,7 @@ namespace MM::Bake
 			int                              bx{ 0 }, by{ 0 };
 			std::vector<std::pair<int, int>> cells;
 			float                            fov{ BakeImage::kBaseFovDeg };
+			int                              grid{ BakePlan::kDefaultGrid };
 			std::shared_ptr<Photo>           photo;
 		};
 		struct FlushJob
@@ -593,6 +566,14 @@ namespace MM::Bake
 		std::mutex  statusMutex;
 		Status      status;  // guarded by statusMutex
 
+		// Only for a bake started through bStartOnLoad (the Photo Baker app or a hand-edited ini): a bake started
+		// from the settings page writes no status file and never quits the game.
+		std::atomic<bool> statusFileOn{ false };
+		std::atomic<bool> unattended{ false };    // bEnterFromMainMenu or bQuitWhenDone: nobody is at the keyboard
+		std::atomic<bool> quitWhenDone{ false };  // bQuitWhenDone, read once at kDataLoaded
+
+		void WriteStatusFile();  // main thread
+
 		void SetMessage(std::string a_msg)
 		{
 			logger::info("bake: {}", a_msg);
@@ -602,8 +583,11 @@ namespace MM::Bake
 
 		void SetPhase(std::string a_phase)
 		{
-			std::lock_guard lock(statusMutex);
-			status.phase = std::move(a_phase);
+			{
+				std::lock_guard lock(statusMutex);
+				status.phase = std::move(a_phase);
+			}
+			WriteStatusFile();
 		}
 
 		void SetTone(std::string a_tone)
@@ -621,6 +605,7 @@ namespace MM::Bake
 		Progress                                                                   wProgress;
 		ID3D11Device*                                                              wDevice = nullptr;
 		ShadeParams                                                                wShade;
+		int                                                                        wGrid = BakePlan::kDefaultGrid;
 		std::vector<PendingShot>                                                   wPending;
 		std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> wSamples;
 		int                                                                        wSampledShots = 0;
@@ -629,17 +614,18 @@ namespace MM::Bake
 		{
 			if (!wDevice)
 				return std::nullopt;
-			const TileId id{ 4, FloorDiv(a_bx, 4) * 4, FloorDiv(a_by, 4) * 4 };
-			std::string  log;
-			Tile         tile = LoadTile(wDevice, Minimap::ReadGameFile, kRootWorld, id, 512, &log);
-			if (tile.absent || !tile.diffuse)
-				return std::nullopt;
 			auto req = std::make_shared<RefRequest>();
-			req->tile = { id, tile.diffuse.Get(), tile.normal.Get(), tile.water.Get() };
-			req->keepDiffuse = tile.diffuse;
-			req->keepNormal = tile.normal;
-			req->keepWater = tile.water;
-			req->centre = { (a_bx + 1) * kCellUnits, (a_by + 1) * kCellUnits };
+			for (const TileId& id : BakePlan::ReferenceTiles(a_bx, a_by, wGrid)) {
+				std::string log;
+				Tile        tile = LoadTile(wDevice, Minimap::ReadGameFile, kRootWorld, id, 512, &log);
+				if (tile.absent || !tile.diffuse)
+					return std::nullopt;
+				req->tiles.push_back({ id, tile.diffuse.Get(), tile.normal.Get(), tile.water.Get() });
+				req->keep.insert(req->keep.end(), { tile.diffuse, tile.normal, tile.water });
+			}
+			req->centre = { BakePlan::BlockCentre(a_bx, wGrid), BakePlan::BlockCentre(a_by, wGrid) };
+			req->size = BakeImage::ReferenceSize(wGrid);
+			req->grid = wGrid;
 			req->shade = wShade;
 			auto future = req->result.get_future();
 			{
@@ -663,22 +649,9 @@ namespace MM::Bake
 			const auto ref = RenderReference(a_bx, a_by);
 			if (!ref)
 				return;
-			constexpr int q = kRefSize / BakeImage::kBlockCells;  // reference px per cell
-			static_assert(q == BakeImage::kSampleSize);
 			for (const auto& [cell, rgb] : a_shot.tiles) {
-				const int                 dx = cell.first - a_bx, dy = cell.second - a_by;
-				std::vector<std::uint8_t> refCell(static_cast<std::size_t>(q) * q * 3);
-				for (int y = 0; y < q; ++y) {
-					for (int x = 0; x < q; ++x) {
-						// Reference row 0 is north, so the block's northern cells (dy = 1) are the top half.
-						const auto* p = ref->data() + ((static_cast<std::size_t>((BakeImage::kBlockCells - 1 - dy) * q + y)) * kRefSize + static_cast<std::size_t>(dx * q + x)) * 4;
-						auto*       o = refCell.data() + (static_cast<std::size_t>(y) * q + x) * 3;
-						o[0] = p[0];
-						o[1] = p[1];
-						o[2] = p[2];
-					}
-				}
-				wSamples.emplace_back(BakeImage::BoxDown(rgb, BakeImage::kTileSize, q), std::move(refCell));
+				const int dx = cell.first - a_bx, dy = cell.second - a_by;
+				wSamples.emplace_back(BakeImage::BoxDown(rgb, BakeImage::kTileSize, BakeImage::kSampleSize), BakeImage::ReferenceCell(*ref, wGrid, dx, dy));
 			}
 		}
 
@@ -741,6 +714,7 @@ namespace MM::Bake
 				wProgress = std::move(b->progress);
 				wDevice = b->device;
 				wShade = b->shade;
+				wGrid = b->grid;
 				wPending.clear();
 				wSamples.clear();
 				wSampledShots = 0;
@@ -762,7 +736,7 @@ namespace MM::Bake
 					DumpPhoto(img, s->key);
 				PendingShot shot{ s->key, {} };
 				for (const auto& cell : s->cells)
-					shot.tiles.push_back({ cell, BakeImage::CropCell(img, s->fov, cell.first - s->bx, cell.second - s->by) });
+					shot.tiles.push_back({ cell, BakeImage::CropCell(img, s->fov, s->grid, cell.first - s->bx, cell.second - s->by) });
 				if (wProgress.toneKnown) {
 					WriteShot(shot);
 					return;
@@ -873,9 +847,8 @@ namespace MM::Bake
 			kFogWait,
 			kFogToggleWait,
 			kFogDecide,
-			kJumpBefore,
-			kJumpAfter,
 			kSettle,
+			kShotCheck,
 			kCapturing,
 			kFinishing
 		};
@@ -900,13 +873,16 @@ namespace MM::Bake
 
 		// Main thread only.
 		Phase             phase = Phase::kIdle;
-		Phase             afterLoad = Phase::kWorldSettle;
+		std::shared_ptr<Photo>    checkPhoto;     // kShotCheck: the photo waiting for its contrast check
+		std::shared_future<float> checkContrast;
+		bool                      flatRetried = false;  // this shot already got a new fog test after a flat photo
 		CapPurpose        capPurpose = CapPurpose::kShot;
 		CamMode           camMode = CamMode::kNone;
 		float             cameraWait = 0.0f;  // extra seconds spent waiting for the camera to reach the shot
 		RE::NiPoint3      camTarget;
 		float             waitLeft = 0;
 		float             loadElapsed = 0;
+		bool              reentering = false;  // a spot did not load: entering again at a map marker, no photo since
 		float             captureElapsed = 0;
 		bool              hudWasShown = true;
 		std::vector<Shot> shots;
@@ -916,6 +892,7 @@ namespace MM::Bake
 		bool              havePrev = false;
 		float             prevX = 0, prevY = 0;
 		float             fov = BakeImage::kBaseFovDeg;
+		int               grid = BakePlan::kDefaultGrid;  // photo grid of the running bake, taken at Start
 		float             settle = 7.0f;
 		bool              tclDone = false;  // console toggles: once per game session, never twice
 		bool              tgmDone = false;
@@ -941,6 +918,160 @@ namespace MM::Bake
 			script->SetCommand(a_cmd);
 			script->CompileAndRun(RE::PlayerCharacter::GetSingleton());
 			delete script;
+		}
+
+		// ---------------------------------------------------------------- Photo Baker app: status, cancel, quit
+
+		std::string JsonText(std::string_view a_s)
+		{
+			std::string out = "\"";
+			for (const char c : a_s) {
+				if (c == '"' || c == '\\') {
+					out += '\\';
+					out += c;
+				} else if (static_cast<unsigned char>(c) < 0x20) {
+					out += std::format("\\u{:04x}", static_cast<int>(c));
+				} else {
+					out += c;
+				}
+			}
+			return out + "\"";
+		}
+
+		void WriteStatusFile()
+		{
+			if (!statusFileOn)
+				return;
+			const Status s = GetStatus();
+			std::string  state = s.state;
+			if (state.empty())
+				state = (phase == Phase::kFinishing || (!s.running && s.writing)) ? "writing" : "running";
+			const auto text = std::format("{{\"state\": {}, \"found\": {}, \"done\": {}, \"etaSeconds\": {:.0f}, \"phase\": {}, \"message\": {}, \"pid\": {}}}\n",
+				JsonText(state), s.found, s.done, s.etaSeconds, JsonText(s.phase), JsonText(s.message), GetCurrentProcessId());
+			std::error_code ec;
+			fs::create_directories(fs::path(kStatusPath).parent_path(), ec);
+			// Temp file and rename: the app polls this file and must never read half of it.
+			const auto tmp = std::string(kStatusPath) + ".tmp";
+			{
+				std::ofstream out(tmp, std::ios::trunc);
+				if (!out)
+					return;
+				out << text;
+			}
+			fs::rename(tmp, kStatusPath, ec);
+			if (ec)
+				logger::warn("bake: could not write the status file: {}", ec.message());
+		}
+
+		bool TakeCancelFlag()
+		{
+			std::error_code ec;
+			if (!fs::exists(kCancelPath, ec))
+				return false;
+			fs::remove(kCancelPath, ec);
+			logger::info("bake: cancel requested by the Photo Baker app");
+			return true;
+		}
+
+		// bQuitWhenDone: leaving the game running after a bake ends in a crash sooner or later (the free camera
+		// cannot be switched off safely), so quit the way the main menu's Quit button does: the main loop sees
+		// Main::quitGame and shuts the game down normally. If that has not happened after 90 s (a stuck shutdown),
+		// end the process: by then every tile and the progress file are already on disk.
+		void QuitGame()
+		{
+			logger::info("bake: bQuitWhenDone set, quitting the game");
+			if (auto* main = RE::Main::GetSingleton())
+				main->GetRuntimeData().quitGame = true;
+			std::thread([] {
+				std::this_thread::sleep_for(90s);
+				logger::warn("bake: the game did not quit within 90 s; ending it");
+				spdlog::default_logger()->flush();
+				TerminateProcess(GetCurrentProcess(), 0);
+			}).detach();
+		}
+
+		// Unattended runs only: a pop-up message box (a mod's first-start question, survival mode and so on)
+		// pauses the game, and every bake wait with it. After it has stayed open for 5 s, answer it the way a
+		// player who wants to be left alone would: a "No / Later / Cancel"-type button if there is one, else
+		// the last button (usually the declining one).
+		void AnswerStuckPopup()
+		{
+			static RE::MessageBoxData* seen = nullptr;
+			static Clock::time_point   since{};
+			auto*                      ui = RE::UI::GetSingleton();
+			if (!ui || !ui->IsMenuOpen(RE::MessageBoxMenu::MENU_NAME)) {
+				seen = nullptr;
+				return;
+			}
+			auto* data = RE::MessageBoxMenu::GetCurrentMessageBoxData();
+			if (!data || data->buttonText.empty())
+				return;
+			if (data != seen) {
+				seen = data;
+				since = Clock::now();
+				return;
+			}
+			if (Clock::now() - since < 5s)
+				return;
+			const auto lower = [](std::string a_s) {
+				for (auto& c : a_s)
+					c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				return a_s;
+			};
+			constexpr std::string_view kDecline[]{ "no", "later", "not now", "maybe later", "cancel", "skip", "close", "ok" };
+			const auto                 count = static_cast<std::int32_t>(data->buttonText.size());
+			std::int32_t               pick = count - 1;
+			for (std::int32_t i = 0; i < count; ++i) {
+				const auto* t = data->buttonText[static_cast<std::uint32_t>(i)].c_str();
+				if (t && std::ranges::find(kDecline, lower(t)) != std::end(kDecline)) {
+					pick = i;
+					break;
+				}
+			}
+			const auto* body = data->bodyText.c_str();
+			const auto* button = data->buttonText[static_cast<std::uint32_t>(pick)].c_str();
+			logger::info("bake: answered a pop-up with '{}': {}", button ? button : "", body ? body : "");
+			seen = nullptr;
+			RE::MessageBoxMenu::SelectOption(pick);
+		}
+
+		// The final status ("done", "cancelled", "error") only once every queued tile is on disk: the app moves
+		// the tiles away when it reads it. Then quit if asked.
+		void FinishAfterWrites(const char* a_state)
+		{
+			if (!statusFileOn)
+				return;
+			std::thread([a_state] {
+				for (int i = 0; i < 1200 && jobsOpen > 0; ++i)  // at most 5 minutes
+					std::this_thread::sleep_for(250ms);
+				SKSE::GetTaskInterface()->AddTask([a_state] {
+					{
+						std::lock_guard lock(statusMutex);
+						status.state = a_state;
+					}
+					WriteStatusFile();
+					if (quitWhenDone)
+						QuitGame();
+				});
+			}).detach();
+		}
+
+		// A bake started through bStartOnLoad that could not start at all: switch the ini keys off (or the
+		// app would start the game again and again) and tell the app.
+		void FailUnattended(const std::string& a_msg, const char* a_state = "error")
+		{
+			SetMessage(a_msg);
+			if (!statusFileOn)
+				return;
+			Settings::ClearBakeStartOnLoad();
+			if (Settings::BakeHideActorsRequested())
+				Settings::SetBakeHideActors(false);
+			{
+				std::lock_guard lock(statusMutex);
+				status.state = a_state;
+			}
+			SetPhase("stopped");
+			FinishAfterWrites(a_state);
 		}
 
 		bool Loaded()
@@ -1040,7 +1171,7 @@ namespace MM::Bake
 		void AimAt(const Shot& a_s)
 		{
 			camMode = CamMode::kShot;
-			camTarget = { a_s.x, a_s.y, a_s.ground + BakeImage::kCameraHeight };
+			camTarget = { a_s.x, a_s.y, a_s.ground + BakeImage::CameraHeight(grid) };
 		}
 
 		void WorldSetup()
@@ -1120,18 +1251,22 @@ namespace MM::Bake
 
 		void UpdateCounts()
 		{
-			std::lock_guard lock(statusMutex);
-			status.done = doneBefore + capturedThisRun;
-			const int left = remainingAtStart - capturedThisRun;
-			if (capturedThisRun > 0 && left > 0) {
-				const double perShot = std::chrono::duration<double>(Clock::now() - firstShotTime).count() / capturedThisRun;
-				status.etaSeconds = perShot * left;
-			} else {
-				status.etaSeconds = 0;
+			{
+				std::lock_guard lock(statusMutex);
+				status.done = doneBefore + capturedThisRun;
+				const int left = remainingAtStart - capturedThisRun;
+				if (capturedThisRun > 0 && left > 0) {
+					const double perShot = std::chrono::duration<double>(Clock::now() - firstShotTime).count() / capturedThisRun;
+					status.etaSeconds = perShot * left;
+				} else {
+					status.etaSeconds = 0;
+				}
 			}
+			WriteStatusFile();  // after every photo
 		}
 
-		void Stop(const std::string& a_msg)
+		// a_state: what the status file says once the last tiles are written.
+		void Stop(const std::string& a_msg, const char* a_state = "error")
 		{
 			if (phase == Phase::kCapturing)
 				EndCaptureUi();
@@ -1148,12 +1283,22 @@ namespace MM::Bake
 			if (actorsHidden || Settings::BakeHideActorsRequested())
 				Settings::SetBakeHideActors(false);
 			Settings::ClearBakeStartOnLoad();
-			std::string msg = a_msg + " The camera stays in free mode: load a save now.";
-			if (actorsHidden)
-				msg += " Restart the game to bring NPCs back.";
+			// With bQuitWhenDone (the Photo Baker app) the game quits by itself: no advice about the camera or NPCs.
+			std::string msg = a_msg;
+			if (!quitWhenDone) {
+				msg += " The camera stays in free mode: load a save now.";
+				if (actorsHidden)
+					msg += " Restart the game to bring NPCs back.";
+			}
 			SetMessage(msg);
+			{
+				std::lock_guard lock(statusMutex);
+				status.state = statusFileOn ? "writing" : "";
+			}
 			SetPhase("stopped");
-			RE::DebugMessageBox(("Modern Minimap: " + msg).c_str());
+			FinishAfterWrites(a_state);
+			if (!quitWhenDone)  // the game quits by itself in a moment: no message box to answer
+				RE::DebugMessageBox(("Modern Minimap: " + msg).c_str());
 		}
 
 		void StartShot(const Shot& a_s)
@@ -1165,6 +1310,52 @@ namespace MM::Bake
 			waitLeft = settle;
 			phase = Phase::kSettle;
 			SetPhase(std::format("settling at {} {},{}", a_s.world, a_s.bx, a_s.by));
+		}
+
+		void AcceptShot(std::shared_ptr<Photo> a_photo)
+		{
+			const Shot& s = shots[cur];
+			Submit(ShotJob{ ShotKey(s.world, s.bx, s.by), s.bx, s.by, s.cells, fov, grid, std::move(a_photo) });
+			if (capturedThisRun++ == 0)
+				firstShotTime = Clock::now();
+			shots[cur].done = true;
+			reentering = false;
+			flatRetried = false;
+			UpdateCounts();
+			++cur;
+			phase = Phase::kNext;
+		}
+
+		// A nearly flat photo (one colour): the fog came back on, or something covers the spot. Test the fog again
+		// and take the photo once more; if it is still flat, save nothing for it.
+		void CheckShot()
+		{
+			if (checkContrast.valid() && checkContrast.wait_for(0s) != std::future_status::ready)
+				return;
+			const float contrast = checkContrast.valid() ? checkContrast.get() : -1.0f;
+			checkContrast = {};
+			if (contrast >= 0.0f && contrast < kFlatContrast && flatRetried) {
+				// Flat again after a new fog test: something covers this spot. No tile is better than a grey one:
+				// the minimap shows the player's terrain there.
+				const Shot& s = shots[cur];
+				logger::warn("bake: photo at {} {},{} still flat (contrast {:.1f}); not saved, your terrain shows there", s.world, s.bx, s.by, contrast);
+				checkPhoto.reset();
+				flatRetried = false;
+				++cur;
+				phase = Phase::kNext;
+				return;
+			}
+			if (contrast >= 0.0f && contrast < kFlatContrast) {
+				const Shot& s = shots[cur];
+				logger::warn("bake: flat photo at {} {},{} (contrast {:.1f}); testing the fog again", s.world, s.bx, s.by, contrast);
+				checkPhoto.reset();
+				flatRetried = true;
+				waitLeft = 0.0f;
+				phase = Phase::kFogWait;  // fog test, then settle and take the photo again
+				SetPhase("fog test again in " + s.world);
+				return;
+			}
+			AcceptShot(std::move(checkPhoto));
 		}
 
 		void OnCaptured(std::shared_ptr<Photo> a_photo)
@@ -1187,19 +1378,37 @@ namespace MM::Bake
 					logger::debug("bake: shot {} {},{} target {:.0f},{:.0f} camera {:.0f},{:.0f},{:.0f}", s.world, s.bx, s.by, camTarget.x, camTarget.y,
 						pos ? pos->x : 0.0f, pos ? pos->y : 0.0f, pos ? pos->z : 0.0f);
 				}
-				if (a_photo) {
-					Submit(ShotJob{ ShotKey(s.world, s.bx, s.by), s.bx, s.by, s.cells, fov, std::move(a_photo) });
-					if (capturedThisRun++ == 0)
-						firstShotTime = Clock::now();
-					shots[cur].done = true;
-					UpdateCounts();
-				} else {
+				if (!a_photo) {
 					logger::warn("bake: capture failed: {} {},{} (taken again on the next run)", s.world, s.bx, s.by);
+					++cur;
+					phase = Phase::kNext;
+					break;
 				}
-				++cur;
-				phase = Phase::kNext;
+				checkContrast = SubmitContrast(a_photo);
+				checkPhoto = std::move(a_photo);
+				phase = Phase::kShotCheck;
 				break;
 			}
+		}
+
+		// A spot that never finished loading: skip its photo and enter again at the map marker nearest the next one
+		// (MoveTo with a loading screen). Stop only when that fails too.
+		void OnLoadTimeout()
+		{
+			if (reentering) {
+				Stop("The new area did not finish loading, even after moving to a map marker.");
+				return;
+			}
+			reentering = true;
+			if (cur < shots.size()) {
+				const Shot& s = shots[cur];
+				logger::warn("bake: area at {} {},{} did not finish loading; photo skipped (tried again on the next run)", s.world, s.bx, s.by);
+				++cur;
+			}
+			curWorld.clear();  // the next photo enters its worldspace again through a map marker
+			havePrev = false;
+			phase = Phase::kNext;
+			SetPhase("area did not load: moving to the next place");
 		}
 
 		void Step(float a_dt)
@@ -1235,12 +1444,14 @@ namespace MM::Bake
 						waitLeft = kDrainWait;
 						phase = Phase::kDrain;
 						SetPhase("waiting before changing worldspace to " + s.world);
-					} else if (havePrev && std::hypot(s.x - prevX, s.y - prevY) / kCellUnits > kJumpCells) {
-						// Long jumps under the high camera made the engine stream a whole new area plus far LOD at
-						// once and crashed it: wait, move, let the new area load. The camera stays where it is.
+					} else if (havePrev && std::hypot(s.x - prevX, s.y - prevY) / kCellUnits > kJumpCells * static_cast<float>(grid) / 2.0f) {
+						// Long jumps go through the map marker nearest the photo (MoveTo, loading screen), like a worldspace
+						// change. Moving the player there with SetPosition left the player's cell detached: the area never loaded.
+						// Under the high camera such a jump also streamed a whole new area plus far LOD at once and crashed.
+						camMode = CamMode::kPlayer;
 						waitLeft = kJumpWait;
-						phase = Phase::kJumpBefore;
-						SetPhase("long jump: waiting");
+						phase = Phase::kDrain;
+						SetPhase("long jump: moving to a map marker");
 					} else {
 						StartShot(s);
 					}
@@ -1259,24 +1470,21 @@ namespace MM::Bake
 					player->MoveTo(ref);
 					loadElapsed = 0;
 					waitLeft = kLoadMinWait;
-					afterLoad = Phase::kWorldSettle;
 					phase = Phase::kWaitLoad;
 					SetPhase("loading " + s.world);
 				}
 				return;
 			case Phase::kWaitLoad:
 				if (waited && Loaded()) {
-					if (afterLoad == Phase::kWorldSettle) {
-						waitLeft = kWorldSettle;
-						phase = Phase::kWorldSettle;
-					} else {
-						StartShot(shots[cur]);
-					}
+					waitLeft = kWorldSettle;
+					phase = Phase::kWorldSettle;
 				}
 				return;
 			case Phase::kWorldSettle:
 				if (waited) {
 					const Shot& s = shots[cur];
+					// Fog test after every loading screen, long jumps included: a loading screen can turn the fog back on
+					// (whole runs of flat dark grey photos near Falkreath when the test was skipped).
 					WorldSetup();
 					MovePlayer(s);
 					AimAt(s);
@@ -1313,21 +1521,6 @@ namespace MM::Bake
 					phase = Phase::kSettle;
 					return;
 				}
-			case Phase::kJumpBefore:
-				if (waited) {
-					MovePlayer(shots[cur]);
-					waitLeft = kJumpWait;
-					phase = Phase::kJumpAfter;
-				}
-				return;
-			case Phase::kJumpAfter:
-				if (waited) {
-					loadElapsed = 0;
-					waitLeft = 0;
-					afterLoad = Phase::kSettle;
-					phase = Phase::kWaitLoad;
-				}
-				return;
 			case Phase::kSettle:
 				if (waited) {
 					// Never photograph a spot the camera has not reached: wait up to kCameraTimeout more, then skip
@@ -1346,9 +1539,12 @@ namespace MM::Bake
 				return;
 			case Phase::kCapturing:
 				return;  // handled in Tick (real time, not game time)
+			case Phase::kShotCheck:
+				CheckShot();
+				return;
 			case Phase::kFinishing:
 				if (jobsOpen == 0)
-					Stop(std::format("Town photo bake finished: {} photos this run.", capturedThisRun));
+					Stop(std::format("Town photo bake finished: {} photos this run.", capturedThisRun), "done");
 				return;
 			}
 		}
@@ -1361,17 +1557,29 @@ namespace MM::Bake
 			const auto now = Clock::now();
 			const float realDt = std::min(std::chrono::duration<float>(now - lastTick).count(), 1.0f);
 			lastTick = now;
+			if (statusFileOn) {
+				static Clock::time_point lastFlagCheck{};
+				if (now - lastFlagCheck > 1s) {  // a file check every frame would be wasted work
+					lastFlagCheck = now;
+					if (TakeCancelFlag())
+						cancelRequested = true;
+				}
+			}
 			if (cancelRequested) {
-				Stop("Town photo bake cancelled; pressing Start again continues where it stopped.");
+				Stop("Town photo bake cancelled; pressing Start again continues where it stopped.", "cancelled");
 				return;
 			}
+			if (unattended)
+				AnswerStuckPopup();
 			auto* ui = RE::UI::GetSingleton();
 			// Waits only run while the game runs: an open menu or a loading screen pauses them.
 			const bool paused = !ui || ui->GameIsPaused() || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
 			DriveCamera();
 
-			if (phase == Phase::kWaitLoad && (loadElapsed += realDt) > kLoadTimeout) {
-				Stop("The new area did not finish loading.");
+			// An open menu pauses the game and cell loading with it: that time does not count. A loading screen does.
+			const bool menuPaused = ui && ui->GameIsPaused() && !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
+			if (phase == Phase::kWaitLoad && !menuPaused && (loadElapsed += realDt) > kLoadTimeout) {
+				OnLoadTimeout();
 				return;
 			}
 			if (phase == Phase::kCapturing) {
@@ -1415,19 +1623,25 @@ namespace MM::Bake
 			});
 		}
 
+		// The photo grid a scan or start uses: the running bake's, otherwise the current setting.
+		int ActiveGrid() { return running ? grid : BakePlan::ClampGrid(Settings::Get()->bake.photoGrid); }
+
 		void Scan()
 		{
 			markers = CollectMarkers();
-			auto       list = BuildShots(markers);
-			const auto progress = LoadProgress();
+			const int  scanGrid = ActiveGrid();
+			auto       list = BuildShots(markers, scanGrid);
+			const auto progress = LoadProgress(scanGrid);
 			int        done = 0;
 			for (const auto& s : list)
 				done += progress.done.contains(ShotKey(s.world, s.bx, s.by)) ? 1 : 0;
+			logger::info("bake: {} map markers -> {} photos with the {} grid ({} done in earlier runs)", markers.size(), list.size(), GridName(scanGrid), done);
+			if (const auto note = DroppedGridNote(progress); !note.empty() && !running)
+				SetMessage(note);
 			std::lock_guard lock(statusMutex);
 			status.found = static_cast<int>(list.size());
 			if (!running)
 				status.done = done;
-			logger::info("bake: {} map markers -> {} photos ({} done in earlier runs)", markers.size(), list.size(), done);
 		}
 
 		void Start()
@@ -1441,29 +1655,35 @@ namespace MM::Bake
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			auto* ui = RE::UI::GetSingleton();
 			if (!player || !player->GetParentCell() || !ui || ui->IsMenuOpen(RE::MainMenu::MENU_NAME)) {
-				SetMessage("Load a save first.");
+				FailUnattended("Load a save first.");
 				return;
 			}
 			Scan();
-			auto list = BuildShots(markers);
+			const auto cfg = Settings::Get();
+			grid = BakePlan::ClampGrid(cfg->bake.photoGrid);
+			auto list = BuildShots(markers, grid);
 			if (list.empty()) {
-				SetMessage("No settlement map markers found.");
+				FailUnattended("No settlement map markers found.");
 				return;
 			}
-			const auto           cfg = Settings::Get();
+			{
+				std::lock_guard lock(statusMutex);
+				status.state.clear();  // running; also clears a final state from an earlier bake this session
+			}
 			const int            count = static_cast<int>(list.size());
-			auto                 progress = LoadProgress();
+			auto                 progress = LoadProgress(grid);
+			const std::string    gridNote = DroppedGridNote(progress);
 			ID3D11Device*        device = Device();
 			// The worker creates the reference tile textures from its own thread; a single-threaded device forbids that.
 			const bool refsOk = device && !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED);
-			Submit(BeginJob{ progress, refsOk ? device : nullptr, cfg->shade });
+			Submit(BeginJob{ progress, refsOk ? device : nullptr, cfg->shade, grid });
 			settle = cfg->bake.settleSeconds;
 			const bool keep = cfg->bake.keepExisting;
 			const int  w = screenW, h = screenH;
 			fov = w > 0 && h > 0 ? BakeImage::BakeFovDeg(w, h) : BakeImage::kBaseFovDeg;
 
 			prepDone = false;
-			std::thread([list = std::move(list), done = progress.done, keep]() mutable {
+			std::thread([list = std::move(list), done = progress.done, keep, runGrid = grid]() mutable {
 				try {
 					GroundReader ground;
 					for (auto& s : list) {
@@ -1479,9 +1699,10 @@ namespace MM::Bake
 							continue;
 						float sum = 0;
 						int   n = 0;
-						for (const float dx : { -kCellUnits / 2, kCellUnits / 2 })
-							for (const float dy : { -kCellUnits / 2, kCellUnits / 2 })
-								if (const auto z = ground.At(s.x + dx, s.y + dy)) {
+						// Every cell centre of the block.
+						for (int dx = 0; dx < runGrid; ++dx)
+							for (int dy = 0; dy < runGrid; ++dy)
+								if (const auto z = ground.At((static_cast<float>(s.bx + dx) + 0.5f) * kCellUnits, (static_cast<float>(s.by + dy) + 0.5f) * kCellUnits)) {
 									sum += *z;
 									++n;
 								}
@@ -1500,13 +1721,14 @@ namespace MM::Bake
 			havePrev = false;
 			camMode = CamMode::kNone;
 			capturedThisRun = 0;
+			reentering = false;
 			cancelRequested = false;
 			lastTick = Clock::now();
 			phase = Phase::kPreparing;
 			running = true;
 			SetPhase("reading ground heights");
-			SetMessage(std::format("Started: {} photos, FOV {:.2f}, settle {:.0f} s{}. Close this menu.", count, fov, settle,
-				actorsHidden ? ", NPCs hidden" : ""));
+			SetMessage(std::format("{}{}Started: {} photos ({} grid), FOV {:.2f}, settle {:.0f} s{}. Close this menu.", gridNote, gridNote.empty() ? "" : " ", count,
+				GridName(grid), fov, settle, actorsHidden ? ", NPCs hidden" : ""));
 			QueueTick();  // the first step; the Present hook queues the rest
 		}
 	}
@@ -1539,23 +1761,69 @@ namespace MM::Bake
 	{
 		if (!Settings::BakeStartOnLoadRequested())
 			return;
-		logger::info("bake: bStartOnLoad set; starting once a game is loaded");
+		const bool fromMenu = Settings::BakeEnterFromMainMenuRequested();
+		quitWhenDone = Settings::BakeQuitWhenDoneRequested();
+		unattended = fromMenu || quitWhenDone;
+		statusFileOn = true;
+		logger::info("bake: bStartOnLoad set; starting once a game is loaded (enter from main menu {}, quit when done {})", fromMenu, quitWhenDone.load());
+		{
+			std::lock_guard lock(statusMutex);
+			status.state = "starting";
+		}
+		SetPhase(fromMenu ? "waiting for the main menu" : "waiting for a save to be loaded");
+
 		// Poll from a helper thread, but do every game check on the main thread through a task.
-		std::thread([] {
-			auto ready = std::make_shared<std::atomic<int>>(0);
-			constexpr int kNeeded = 15;  // 15 checks 2 s apart: let the area, LOD and start-up pop-ups settle first
-			while (ready->load() < kNeeded) {
-				std::this_thread::sleep_for(std::chrono::seconds(2));
-				SKSE::GetTaskInterface()->AddTask([ready] {
+		struct Wait
+		{
+			std::atomic<int>  ready{ 0 };
+			std::atomic<int>  menuIdle{ 0 };
+			std::atomic<bool> entered{ false };
+			std::atomic<bool> cancelled{ false };
+		};
+		std::thread([fromMenu] {
+			auto          w = std::make_shared<Wait>();
+			constexpr int kNeeded = 30;   // 30 checks 1 s apart: let the area, LOD and start-up pop-ups settle first
+			constexpr int kMenuIdle = 5;  // main menu open and quiet this many checks in a row before the coc
+			while (w->ready.load() < kNeeded && !w->cancelled) {
+				std::this_thread::sleep_for(1s);
+				SKSE::GetTaskInterface()->AddTask([w, fromMenu] {
+					if (w->cancelled || w->ready.load() >= kNeeded)
+						return;
+					if (TakeCancelFlag()) {
+						w->cancelled = true;
+						return;
+					}
+					if (unattended)
+						AnswerStuckPopup();
 					auto* player = RE::PlayerCharacter::GetSingleton();
 					auto* ui = RE::UI::GetSingleton();
+					// bEnterFromMainMenu: coc is only safe from the main menu. In game a save-reload mod turns it into
+					// a game restart, which is why the bake itself moves with MoveTo. Wait until the menu has
+					// finished fading in and nothing else (a pop-up, a loading screen) is open.
+					if (fromMenu && !w->entered && ui) {
+						const bool idle = ui->IsMenuOpen(RE::MainMenu::MENU_NAME) && !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) &&
+						                  !ui->IsMenuOpen(RE::MessageBoxMenu::MENU_NAME);
+						if (!idle) {
+							w->menuIdle = 0;
+						} else if (++w->menuIdle >= kMenuIdle) {
+							w->entered = true;
+							SetPhase(std::format("entering the world from the main menu (coc {})", kMenuCell));
+							Console(std::format("coc {}", kMenuCell));
+						}
+					}
 					const bool ok = player && player->Is3DLoaded() && ui && !ui->GameIsPaused() &&
 					                !ui->IsMenuOpen(RE::MainMenu::MENU_NAME) && !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME);
-					if (ok)
-						ready->fetch_add(1);
-					else
-						ready->store(0);
+					if (ok) {
+						if (w->ready.fetch_add(1) == 0)
+							SetPhase("in the world, waiting for it to settle");
+					} else {
+						w->ready.store(0);
+					}
 				});
+			}
+			if (w->cancelled) {
+				SKSE::GetTaskInterface()->AddTask([] { FailUnattended("Town photo bake cancelled before it started.", "cancelled"); });
+				return;
 			}
 			logger::info("bake: game loaded, starting from bStartOnLoad");
 			RequestStart();

@@ -215,17 +215,21 @@ namespace MM::BakeImage
 		return static_cast<float>(half * 360.0 / std::numbers::pi);
 	}
 
-	double UnitsPerPixel(int a_w, float a_fovDeg)
+	float CameraHeight(int a_grid) { return kCameraHeight * static_cast<float>(a_grid) / 2.0f; }
+
+	int ReferenceSize(int a_grid) { return kSampleSize * a_grid; }
+
+	double UnitsPerPixel(int a_w, float a_fovDeg, int a_grid)
 	{
-		return 2.0 * kCameraHeight * std::tan(a_fovDeg * std::numbers::pi / 360.0) / std::max(a_w, 1);
+		return 2.0 * CameraHeight(a_grid) * std::tan(a_fovDeg * std::numbers::pi / 360.0) / std::max(a_w, 1);
 	}
 
-	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_dx, int a_dy)
+	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_grid, int a_dx, int a_dy)
 	{
 		// The block's south-west corner sits half a block left of and below the picture centre.
-		const double cellPx = kCellUnits / UnitsPerPixel(a_photo.w, a_fovDeg);
-		const double x0 = a_photo.w / 2.0 - kBlockCells * cellPx / 2 + a_dx * cellPx;
-		const double y1 = a_photo.h / 2.0 + kBlockCells * cellPx / 2 - a_dy * cellPx;  // south edge of the cell
+		const double cellPx = kCellUnits / UnitsPerPixel(a_photo.w, a_fovDeg, a_grid);
+		const double x0 = a_photo.w / 2.0 - a_grid * cellPx / 2 + a_dx * cellPx;
+		const double y1 = a_photo.h / 2.0 + a_grid * cellPx / 2 - a_dy * cellPx;  // south edge of the cell
 		const double y0 = y1 - cellPx;
 		const auto   tx = AxisTaps(x0, x0 + cellPx, kTileSize, a_photo.w);
 		const auto   ty = AxisTaps(y0, y1, kTileSize, a_photo.h);
@@ -274,6 +278,26 @@ namespace MM::BakeImage
 			}
 		}
 		return out;
+	}
+
+	std::vector<std::uint8_t> ReferenceCell(std::span<const std::uint8_t> a_rgba, int a_grid, int a_dx, int a_dy)
+	{
+		constexpr int             q = kSampleSize;
+		const int                 refSize = ReferenceSize(a_grid);
+		std::vector<std::uint8_t> cell(static_cast<std::size_t>(q) * q * 3);
+		if (a_rgba.size() < static_cast<std::size_t>(refSize) * refSize * 4)
+			return cell;
+		for (int y = 0; y < q; ++y) {
+			for (int x = 0; x < q; ++x) {
+				// Reference row 0 is north, so the block's northern cells (high dy) are the top rows.
+				const auto* p = a_rgba.data() + (static_cast<std::size_t>((a_grid - 1 - a_dy) * q + y) * refSize + static_cast<std::size_t>(a_dx * q + x)) * 4;
+				auto*       o = cell.data() + (static_cast<std::size_t>(y) * q + x) * 3;
+				o[0] = p[0];
+				o[1] = p[1];
+				o[2] = p[2];
+			}
+		}
+		return cell;
 	}
 
 	std::vector<std::uint8_t> BoxDown(std::span<const std::uint8_t> a_rgb, int a_size, int a_out)

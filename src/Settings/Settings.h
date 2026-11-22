@@ -64,6 +64,7 @@ namespace MM::Settings
 		float settleSeconds{ 7.0f };  // wait after each move before the picture (cells + LOD fade-in)
 		float areaScale{ 1.0f };      // multiplies the photo radius around every map marker (bigger = more of the map, longer bake)
 		bool  keepExisting{ false };  // skip cells that already have a photo tile (e.g. from another mod)
+		int   photoGrid{ 2 };         // cells per photo side, 1..4: 1 = sharpest and slowest, 4 = fastest and softest
 	};
 
 	struct Values
@@ -77,6 +78,7 @@ namespace MM::Settings
 		bool               round{ true };
 		float              opacity{ 0.9f };
 		float              brightness{ 1.0f };  // whole minimap (map + icons), every colour mode
+		MapStyle           style{ MapStyle::kNatural };  // look of the map (not the icons)
 		bool               rotateWithPlayer{ true };
 		bool               useCameraYaw{ false };
 		bool               hideInInteriors{ false };
@@ -89,6 +91,8 @@ namespace MM::Settings
 		float              otherFloorAlpha{ 0.0f }; // interior map: other floors drawn this faint (0 = hidden)
 		bool               debugLog{ false };       // debug level: once-a-minute cost line
 		std::vector<float> zoomRadii{ 3000.0f, 6000.0f, 12000.0f };
+		bool               autoZoom{ true };           // outdoors: zoom out while sprinting or riding
+		float              autoZoomStrength{ 1.0f };  // how far: up to 1 + this times the zoom step at a gallop
 		std::uint32_t      zoomKey{ 0x4E };  // numpad +
 		std::uint32_t      hideKey{ 0x4A };  // numpad -
 		int                cacheMB{ 48 };
@@ -113,7 +117,10 @@ namespace MM::Settings
 	bool BakeHideActorsRequested();
 	void SetBakeHideActors(bool a_on);
 	bool BakeStartOnLoadRequested();  // [Bake] bStartOnLoad
-	void ClearBakeStartOnLoad();       // when a bake finishes or is cancelled
+	// Set by the Photo Baker app together with bStartOnLoad, so it can run a bake unattended.
+	bool BakeEnterFromMainMenuRequested();  // [Bake] bEnterFromMainMenu: coc from the main menu instead of waiting for a save
+	bool BakeQuitWhenDoneRequested();       // [Bake] bQuitWhenDone: quit the game once the tiles are written
+	void ClearBakeStartOnLoad();       // when a bake finishes or is cancelled: clears the three keys above
 
 	// "3000,6000,12000" <-> radii (500..200000 units each). Empty result = keep the old list.
 	std::vector<float> ParseRadii(const std::string& a_list);

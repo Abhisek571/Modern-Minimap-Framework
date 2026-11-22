@@ -1,0 +1,7 @@
+#pragma once
+
+// Filled in by CMake from the project version.
+#define MMPB_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define MMPB_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define MMPB_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define MMPB_VERSION_STRING "@PROJECT_VERSION@"

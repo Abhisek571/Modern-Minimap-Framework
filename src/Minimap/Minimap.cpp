@@ -361,6 +361,43 @@ namespace MM::Minimap
 			return data;
 		}
 
+		// Auto zoom state (main thread only): the player's ground speed and the eased zoom factor.
+		struct AutoZoomState
+		{
+			bool         havePos{ false };
+			RE::NiPoint3 lastPos;
+			double       lastTime{ 0 };
+			float        speed{ 0 };   // smoothed, world units per second
+			float        factor{ 1 };  // eased, multiplies the zoom radius
+		} autoZoom;
+
+		// Zoom radius multiplier for the player's speed. Off, indoors or after a teleport the factor eases back to 1.
+		float AutoZoomFactor(const Settings::Values& a_cfg, bool a_active, const RE::NiPoint3& a_pos, double a_now)
+		{
+			constexpr float kTeleportSpeed = 5000.0f;  // faster than any horse: a load door, fast travel or setpos
+			constexpr float kSpeedSeconds = 0.4f;      // speed smoothing time constant
+			constexpr float kMaxSampleSeconds = 0.5f;  // a longer gap (menu, hidden map, load) is no speed sample
+			auto&       z = autoZoom;
+			const float dt = z.havePos ? static_cast<float>(a_now - z.lastTime) : 0.0f;
+			float       target = 1.0f;
+			if (a_cfg.autoZoom && a_active && z.havePos && dt > 0.0f) {
+				const float dist = std::hypot(a_pos.x - z.lastPos.x, a_pos.y - z.lastPos.y);
+				const float raw = dist / dt;
+				if (raw < kTeleportSpeed && dt < kMaxSampleSeconds)
+					z.speed += (raw - z.speed) * (1.0f - std::exp(-dt / kSpeedSeconds));
+				else
+					z.speed = 0.0f;
+				target = AutoZoomTarget(z.speed, a_cfg.autoZoomStrength);
+			} else if (!a_active) {
+				z.speed = 0.0f;
+			}
+			z.factor = EaseAutoZoom(z.factor, target, std::min(dt, 0.25f));
+			z.havePos = a_active;
+			z.lastPos = a_pos;
+			z.lastTime = a_now;
+			return QuantizeZoom(z.factor);
+		}
+
 		// Main thread, once per frame (queued from Draw): reads every game object the minimap needs.
 		void GameTick()
 		{
@@ -386,6 +423,9 @@ namespace MM::Minimap
 					const auto steps = static_cast<std::uint32_t>(cfg.zoomRadii.size());
 					s.radius = cfg.zoomRadii[zoomIndex % steps] * (hasMap ? 1.0f : cfg.radarZoomScale);
 					const double nowSec = Seconds(begin);
+					const float zoomFactor = AutoZoomFactor(cfg, hasMap, s.pos, nowSec);
+					if (hasMap)
+						s.radius *= zoomFactor;
 					IconData::Update(nowSec, cfg, player, s.radius);
 					if (cfg.icons.enabled)
 						IconData::Collect(nowSec, s.icons);
@@ -529,6 +569,7 @@ namespace MM::Minimap
 		op.round = cfg.round;
 		op.linearOut = cfg.colorMode == 2 || (cfg.colorMode == 0 && (IsSrgb(targetFormat) || IsFloat(targetFormat)));
 		op.outScale = cfg.brightness * (IsFloat(targetFormat) && op.linearOut ? cfg.hdrBrightness : 1.0f);
+		op.look = LookForStyle(cfg.style);
 
 		const std::string& world = snap.world;
 		const bool  tileMap = !world.empty() && cache;

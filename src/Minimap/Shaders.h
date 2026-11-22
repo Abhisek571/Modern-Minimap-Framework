@@ -25,6 +25,8 @@ cbuffer OverlayCB : register(b0)
 	float4 oRot;    // cos/sin of map angle, cos/sin of arrow angle
 	float4 oStyle;  // opacity, round, hasMap, arrow size px
 	float4 oOut;    // x = write linear colour (sRGB / float HUD target), y = brightness scale
+	float4 oLook;   // map style: saturation, contrast
+	float4 oTint;   // map style: rgb tint
 };
 
 cbuffer IconCB : register(b0)
@@ -126,6 +128,9 @@ float4 PSOverlay(VSOut i) : SV_Target
 		float2 m = float2(q.x * oRot.x - q.y * oRot.y, -q.x * oRot.y - q.y * oRot.x);  // screen -> east/north px
 		float2 p = float2(oGeo.y * 0.5 + oGeo.z + m.x, oGeo.y * 0.5 - oGeo.w - m.y);
 		col = texA.Sample(samp, p / oGeo.y).rgb;
+		float g = dot(col, float3(0.299, 0.587, 0.114));
+		col = lerp(float3(g, g, g), col, oLook.x);
+		col = saturate(((col - 0.5) * oLook.y + 0.5) * oTint.rgb);
 	}
 
 	// Rim.

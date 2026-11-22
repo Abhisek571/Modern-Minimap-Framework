@@ -3,6 +3,7 @@
 //
 // Usage: ModernMinimapTests <data folder with textures\terrain and meshes\terrain> <output folder>
 
+#include "BakePlan.h"
 #include "PhotoProcessing.h"
 #include "TerrainMesh.h"
 #include "Icons.h"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numbers>
+#include <sstream>
 #include <wincodec.h>
 
 using namespace MM;
@@ -94,6 +96,27 @@ namespace
 		Check(MaskCoverage({ 0, 0 }, 256, true) == 1.0f && MaskCoverage({ 129, 0 }, 256, true) == 0.0f, "round mask centre/outside");
 		Check(MaskCoverage({ 120, 120 }, 256, true) == 0.0f && MaskCoverage({ 120, 120 }, 256, false) == 1.0f, "corner: round out, square in");
 		Check(Near(MaskCoverage({ 128, 0 }, 256, true), 0.5f), "mask edge anti-aliased");
+
+		// Map styles: natural is unchanged, black and white and parchment have no colour, a bad value falls back.
+		const MapLook natural = LookForStyle(MapStyle::kNatural);
+		Check(natural.saturation == 1.0f && natural.contrast == 1.0f && natural.tintR == 1.0f && natural.tintB == 1.0f, "natural style is unchanged");
+		Check(LookForStyle(MapStyle::kBlackWhite).saturation == 0.0f && LookForStyle(MapStyle::kParchment).saturation == 0.0f, "grey styles");
+		Check(LookForStyle(MapStyle::kParchment).tintR > LookForStyle(MapStyle::kParchment).tintB, "parchment is warm");
+		Check(LookForStyle(static_cast<MapStyle>(99)).saturation == 1.0f, "unknown style falls back to natural");
+
+		// Auto zoom: no change up to a run, full strength at a gallop, never below 1, bad input = no change.
+		Check(AutoZoomTarget(0, 1.5f) == 1.0f && AutoZoomTarget(300, 1.5f) == 1.0f, "auto zoom: standing and running unchanged");
+		Check(Near(AutoZoomTarget(900, 1.5f), 2.5f) && Near(AutoZoomTarget(5000, 1.5f), 2.5f), "auto zoom: gallop = 1 + strength");
+		Check(AutoZoomTarget(600, 1.0f) > 1.0f && AutoZoomTarget(600, 1.0f) < 2.0f, "auto zoom: sprint in between");
+		Check(AutoZoomTarget(900, 0.0f) == 1.0f && AutoZoomTarget(NAN, 1.0f) == 1.0f && AutoZoomTarget(900, NAN) == 1.0f, "auto zoom: off or bad input");
+		const float out = EaseAutoZoom(1.0f, 2.0f, 0.1f), back = EaseAutoZoom(2.0f, 1.0f, 0.1f);
+		Check(out > 1.0f && out < 2.0f && back < 2.0f && back > 1.0f && (out - 1.0f) > (2.0f - back), "auto zoom eases, out faster than in");
+		Check(EaseAutoZoom(1.3f, 2.0f, 0.0f) == 1.3f && EaseAutoZoom(NAN, 2.0f, 0.1f) == 2.0f, "auto zoom: no time or bad state");
+		float eased = 1.0f;
+		for (int frame = 0; frame < 600; ++frame)
+			eased = EaseAutoZoom(eased, 2.0f, 1.0f / 60.0f);
+		Check(Near(eased, 2.0f, 0.01f), "auto zoom reaches its target");
+		Check(QuantizeZoom(1.01f) == 1.0f && QuantizeZoom(1.03f) == 1.03125f, "zoom factor in 1/32 steps");
 	}
 
 	bool ReadFile(const fs::path& a_root, const std::string& a_rel, std::vector<std::uint8_t>& a_out)
@@ -351,6 +374,32 @@ namespace
 		Check(after.Get() == rtv.Get(), "state restored (render target)");
 
 		Check(SaveColor(a_ctx, tex.Get(), a_out / "overlay_preview.png"), "save overlay_preview.png");
+
+		// The four map styles side by side (natural, muted, black and white, parchment), same compose.
+		a_ctx->ClearRenderTargetView(rtv.Get(), grey);
+		D3D11_TEXTURE2D_DESC sd = td;
+		sd.Width = 4 * 300;
+		ComPtr<ID3D11Texture2D>        styleTex;
+		ComPtr<ID3D11RenderTargetView> styleRtv;
+		if (FAILED(a_dev->CreateTexture2D(&sd, nullptr, &styleTex)) || FAILED(a_dev->CreateRenderTargetView(styleTex.Get(), nullptr, &styleRtv))) {
+			Check(false, "style preview target");
+			return;
+		}
+		a_ctx->ClearRenderTargetView(styleRtv.Get(), grey);
+		a_ctx->OMSetRenderTargets(1, styleRtv.GetAddressOf(), nullptr);
+		const D3D11_VIEWPORT svp{ 0, 0, static_cast<float>(sd.Width), static_cast<float>(sd.Height), 0, 1 };
+		a_ctx->RSSetViewports(1, &svp);
+		op.viewportW = static_cast<float>(sd.Width);
+		op.hasMap = true;
+		op.round = true;
+		op.mapAngle = 0;
+		op.arrowAngle = heading;
+		for (int style = 0; style < static_cast<int>(MapStyle::kCount); ++style) {
+			op.left = 22.0f + 300.0f * style;
+			op.look = LookForStyle(static_cast<MapStyle>(style));
+			renderer.DrawOverlay(a_ctx, op);
+		}
+		Check(SaveColor(a_ctx, styleTex.Get(), a_out / "style_preview.png"), "save style_preview.png");
 	}
 
 	// ---- M4: icons ----
@@ -927,7 +976,7 @@ namespace
 		img.w = 1920;
 		img.h = 1080;
 		img.px.assign(static_cast<std::size_t>(img.w) * img.h * 3, 0.0f);
-		const double cellPx = kCellUnits / BI::UnitsPerPixel(img.w, 7.7f);
+		const double cellPx = kCellUnits / BI::UnitsPerPixel(img.w, 7.7f, 2);
 		Check(cellPx > 500 && cellPx < 520, "about 508 photo px per cell at 1080p");
 		const float colours[2][2][3]{ { { 200, 0, 0 }, { 0, 200, 0 } }, { { 0, 0, 200 }, { 200, 200, 0 } } };  // [dy][dx]
 		for (int y = 0; y < img.h; ++y) {
@@ -940,7 +989,7 @@ namespace
 		bool cropOk = true;
 		for (int dy = 0; dy < 2; ++dy) {
 			for (int dx = 0; dx < 2; ++dx) {
-				const auto  tile = BI::CropCell(img, 7.7f, dx, dy);
+				const auto  tile = BI::CropCell(img, 7.7f, 2, dx, dy);
 				const auto* mid = tile.data() + (static_cast<std::size_t>(256) * 512 + 256) * 3;
 				for (int c = 0; c < 3; ++c)
 					cropOk &= std::abs(mid[c] - static_cast<int>(colours[dy][dx][c])) <= 1;
@@ -971,6 +1020,143 @@ namespace
 				worst = std::max(worst, std::abs(back[i][c] - static_cast<int>(px[i][c])));
 		std::printf("bake: BC1 gradient worst error %d\n", worst);
 		Check(worst <= 9, "BC1 encoder error on a gradient");
+	}
+
+	// Photo grid N x N: camera height, crop geometry and the colour reference for N = 1..4 (2 = the original bake).
+	void TestBakeGridGeometry()
+	{
+		namespace BI = BakeImage;
+		Check(BI::CameraHeight(2) == 115000.0f && BI::CameraHeight(1) == 57500.0f && BI::CameraHeight(3) == 172500.0f && BI::CameraHeight(4) == 230000.0f,
+			"grid: camera height 115000 * N / 2");
+		Check(BI::UnitsPerPixel(1920, 7.7f, 2) == 2.0 * 115000.0f * std::tan(7.7f * std::numbers::pi / 360.0) / 1920, "grid 2: units per pixel same as before");
+
+		for (int grid = 1; grid <= 4; ++grid) {
+			// Synthetic 1920x1080 photo: every cell of the block a flat colour, grey around it.
+			BI::RgbImage img;
+			img.w = 1920;
+			img.h = 1080;
+			img.px.assign(static_cast<std::size_t>(img.w) * img.h * 3, 128.0f);
+			const double cellPx = kCellUnits / BI::UnitsPerPixel(img.w, 7.7f, grid);
+			const double blockPx = cellPx * grid;
+			const auto   colour = [](int a_dx, int a_dy, int a_c) { return static_cast<float>((a_dx * 61 + a_dy * 101 + a_c * 37) % 200 + 20); };
+			for (int y = 0; y < img.h; ++y) {
+				for (int x = 0; x < img.w; ++x) {
+					const double ex = x + 0.5 - (img.w / 2.0 - blockPx / 2), ny = (img.h / 2.0 + blockPx / 2) - (y + 0.5);  // east / north of the SW corner
+					if (ex < 0 || ny < 0 || ex >= blockPx || ny >= blockPx)
+						continue;
+					const int dx = static_cast<int>(ex / cellPx), dy = static_cast<int>(ny / cellPx);
+					for (int c = 0; c < 3; ++c)
+						img.px[(static_cast<std::size_t>(y) * img.w + x) * 3 + c] = colour(dx, dy, c);
+				}
+			}
+			Check(blockPx > 1000 && blockPx <= 1080, std::format("grid {}: the block fits the 1080 px picture height", grid).c_str());
+			bool cropOk = true;
+			for (int dy = 0; dy < grid; ++dy) {
+				for (int dx = 0; dx < grid; ++dx) {
+					const auto tile = BI::CropCell(img, 7.7f, grid, dx, dy);
+					cropOk &= tile.size() == static_cast<std::size_t>(BI::kTileSize) * BI::kTileSize * 3;
+					for (const auto& [tx, ty] : { std::pair{ 256, 256 }, std::pair{ 128, 128 }, std::pair{ 384, 384 } }) {
+						const auto* px = tile.data() + (static_cast<std::size_t>(ty) * BI::kTileSize + tx) * 3;
+						for (int c = 0; c < 3; ++c)
+							cropOk &= std::abs(px[c] - static_cast<int>(colour(dx, dy, c))) <= 1;
+					}
+				}
+			}
+			Check(cropOk, std::format("grid {}: crop picks the right cell of the block", grid).c_str());
+
+			// Colour reference: kSampleSize px per cell whatever the grid.
+			const int refSize = BI::ReferenceSize(grid);
+			Check(refSize == BI::kSampleSize * grid, std::format("grid {}: reference size {} px", grid, refSize).c_str());
+			std::vector<std::uint8_t> rgba(static_cast<std::size_t>(refSize) * refSize * 4);
+			for (int y = 0; y < refSize; ++y)
+				for (int x = 0; x < refSize; ++x)
+					for (int c = 0; c < 4; ++c)
+						rgba[(static_cast<std::size_t>(y) * refSize + x) * 4 + c] =
+							static_cast<std::uint8_t>(colour(x / BI::kSampleSize, grid - 1 - y / BI::kSampleSize, c % 3));  // row 0 = north
+			bool refOk = true;
+			for (int dy = 0; dy < grid; ++dy) {
+				for (int dx = 0; dx < grid; ++dx) {
+					const auto cell = BI::ReferenceCell(rgba, grid, dx, dy);
+					refOk &= cell.size() == static_cast<std::size_t>(BI::kSampleSize) * BI::kSampleSize * 3;
+					for (std::size_t i = 0; refOk && i < cell.size(); ++i)
+						refOk &= cell[i] == static_cast<std::uint8_t>(colour(dx, dy, static_cast<int>(i % 3)));
+				}
+			}
+			Check(refOk, std::format("grid {}: reference cell picks the right part of the render", grid).c_str());
+		}
+		Check(BI::ReferenceSize(2) == 128, "grid 2: reference render 128 px as before");
+		const std::vector<std::uint8_t> shortRender(16);
+		const auto                      blank = BI::ReferenceCell(shortRender, 2, 0, 0);
+		Check(blank.size() == static_cast<std::size_t>(BI::kSampleSize) * BI::kSampleSize * 3 && std::ranges::all_of(blank, [](std::uint8_t a_v) { return a_v == 0; }),
+			"reference cell of a too small render is blank, not a read past the end");
+	}
+
+	// Photo grid: block list alignment, block centres, reference tiles, and the progress file across grid changes.
+	void TestBakePlan()
+	{
+		namespace BP = BakePlan;
+		Check(BP::ClampGrid(0) == 1 && BP::ClampGrid(-5) == 1 && BP::ClampGrid(9) == 4 && BP::ClampGrid(3) == 3, "grid clamped to 1..4");
+		Check(BP::BlockCentre(4, 2) == 5 * kCellUnits && BP::BlockCentre(-2, 2) == -1 * kCellUnits, "grid 2: block centre = shared corner, as before");
+		Check(BP::BlockCentre(3, 3) == 4.5f * kCellUnits && BP::BlockCentre(-3, 1) == -2.5f * kCellUnits && BP::BlockCentre(-4, 4) == -2 * kCellUnits, "block centre for grids 1, 3, 4");
+
+		const std::set<std::pair<int, int>> cells{ { 0, 0 }, { 1, 1 }, { 2, 2 }, { 3, 0 }, { -1, -1 }, { 5, 7 }, { -3, 8 } };
+		const auto                          blocks3 = BP::Blocks(cells, 3);
+		const bool aligned3 = std::ranges::all_of(blocks3, [](const auto& a_b) { return FloorDiv(a_b.first, 3) * 3 == a_b.first && FloorDiv(a_b.second, 3) * 3 == a_b.second; });
+		Check(aligned3, "grid 3: blocks at multiples of 3");
+		const std::vector<std::pair<int, int>> want3{ { -3, 6 }, { 3, 6 }, { 0, 0 }, { 3, 0 }, { -3, -3 } };  // north to south, serpentine by row
+		Check(blocks3 == want3, "grid 3: block list covers every cell once, north to south, serpentine");
+		bool covered3 = true;
+		for (const auto& [cx, cy] : cells)
+			covered3 &= std::ranges::count_if(blocks3, [&](const auto& a_b) { return cx >= a_b.first && cx < a_b.first + 3 && cy >= a_b.second && cy < a_b.second + 3; }) == 1;
+		Check(covered3, "grid 3: each cell in exactly one block");
+		const std::vector<std::pair<int, int>> want2{ { -4, 8 }, { 4, 6 }, { 2, 2 }, { 0, 0 }, { 2, 0 }, { -2, -2 } };
+		Check(BP::Blocks(cells, 2) == want2, "grid 2: even-aligned block list in the original order");
+		const auto blocks1 = BP::Blocks(cells, 1);
+		Check(blocks1.size() == cells.size(), "grid 1: one block per cell");
+		Check(BP::Blocks({}, 3).empty(), "no cells -> no blocks");
+
+		Check(BP::ReferenceTiles(2, -2, 2) == std::vector<TileId>{ { 4, 0, -4 } }, "grid 2: one reference LOD tile");
+		Check(BP::ReferenceTiles(-4, 4, 4) == std::vector<TileId>{ { 4, -4, 4 } }, "grid 4: one reference LOD tile");
+		Check(BP::ReferenceTiles(3, 3, 3) == std::vector<TileId>{ { 4, 0, 0 }, { 4, 4, 0 }, { 4, 0, 4 }, { 4, 4, 4 } }, "grid 3: block across four LOD tiles");
+		Check(BP::ReferenceTiles(0, -3, 3).size() == 1 && BP::ReferenceTiles(-3, 0, 1).size() == 1, "grid 3 inside one tile / grid 1: one tile");
+
+		// Progress file.
+		BP::Progress saved;
+		saved.grid = 2;
+		saved.toneKnown = true;
+		saved.tone.fitted = true;
+		saved.tone.lut.fill(10.0f);
+		saved.tone.gain = { 1.25f, 1.0f, 0.75f };
+		saved.done = { BP::ShotKey("Tamriel", 4, -2), BP::ShotKey("WhiterunWorld", 6, 0) };
+		std::ostringstream text;
+		BP::WriteProgress(text, saved);
+		Check(text.str().find("\ngrid 2\n") != std::string::npos, "progress file stores the grid");
+
+		std::istringstream same(text.str());
+		const auto         kept = BP::ParseProgress(same, 2);
+		Check(kept.grid == 2 && kept.droppedGrid == 0 && kept.done == saved.done && kept.toneKnown && kept.tone.fitted && Near(kept.tone.gain[0], 1.25f) && Near(kept.tone.lut[200], 10.0f),
+			"progress: same grid keeps the finished shots and the colour match");
+
+		std::istringstream other(text.str());
+		const auto         fresh = BP::ParseProgress(other, 3);
+		Check(fresh.grid == 3 && fresh.droppedGrid == 2 && fresh.done.empty(), "progress: another grid drops the finished shots and names the old grid");
+		Check(fresh.toneKnown && fresh.tone.fitted && Near(fresh.tone.gain[2], 0.75f), "progress: another grid keeps the colour match");
+		std::ostringstream rewritten;
+		BP::WriteProgress(rewritten, fresh);
+		Check(rewritten.str().find("\ngrid 3\n") != std::string::npos && rewritten.str().find("done ") == std::string::npos, "progress: rewritten for the new grid, no old shots");
+
+		const std::string  legacyText = "# old file\ndone Tamriel 4 -2\ndone Tamriel 6 -2\n";
+		std::istringstream legacy2(legacyText), legacy4(legacyText);
+		Check(BP::ParseProgress(legacy2, 2).done.size() == 2, "progress: a file without a grid line is a 2x2 bake");
+		const auto legacyOther = BP::ParseProgress(legacy4, 4);
+		Check(legacyOther.done.empty() && legacyOther.droppedGrid == 2, "progress: a file without a grid line does not match 4x4");
+
+		std::istringstream empty;
+		const auto         none = BP::ParseProgress(empty, 3);
+		Check(none.grid == 3 && none.done.empty() && none.droppedGrid == 0 && !none.toneKnown, "progress: no file -> nothing dropped, nothing to report");
+		std::istringstream junk("grid x\ndone Tamriel\nlut 1 2\n");
+		const auto         junkRead = BP::ParseProgress(junk, 2);
+		Check(junkRead.done.empty() && junkRead.droppedGrid == 0, "progress: broken lines are ignored");
 	}
 
 	void TestBakeDds(ID3D11Device* a_dev)
@@ -1005,6 +1191,8 @@ int main(int argc, char** argv)
 	TestAtlas();
 	TestNavMesh();
 	TestBakeImage();
+	TestBakeGridGeometry();
+	TestBakePlan();
 	TestBtr(data);
 
 	if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))

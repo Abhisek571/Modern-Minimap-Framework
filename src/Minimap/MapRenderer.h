@@ -58,6 +58,7 @@ namespace MM
 		bool  hasMap{ true };
 		bool  linearOut{ false };  // HUD target is sRGB-typed or float: write linear colour
 		float outScale{ 1.0f };
+		MapLook look;              // map style (the map only, not the arrow or rim)
 	};
 
 	struct IconPassParams

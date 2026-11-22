@@ -112,6 +112,35 @@ namespace MM
 	// Heading (radians, clockwise from north) of a forward vector given in world x (east) / y (north).
 	inline float HeadingFromForward(float a_east, float a_north) noexcept { return std::atan2(a_east, a_north); }
 
+	// Look of the whole map (photos, terrain and interiors; not the icons), applied when it is drawn on the HUD.
+	enum class MapStyle
+	{
+		kNatural,
+		kMuted,
+		kBlackWhite,
+		kParchment,
+		kCount
+	};
+
+	struct MapLook
+	{
+		float saturation{ 1.0f };  // 0 = grey
+		float contrast{ 1.0f };    // around mid grey
+		float tintR{ 1.0f }, tintG{ 1.0f }, tintB{ 1.0f };
+	};
+
+	MapLook LookForStyle(MapStyle a_style) noexcept;
+
+	// Auto zoom: how much farther the map shows at a speed (world units per second). 1 = the chosen zoom step
+	// (walking and running), up to 1 + a_strength at a horse gallop.
+	float AutoZoomTarget(float a_speed, float a_strength) noexcept;
+
+	// One step of the eased zoom factor toward its target: zooms out quickly when you speed up and back in slowly.
+	float EaseAutoZoom(float a_current, float a_target, float a_dt) noexcept;
+
+	// The zoom factor in steps of 1/32, so the map is redrawn a few times per change, not every frame.
+	inline float QuantizeZoom(float a_factor) noexcept { return std::round(a_factor * 32.0f) / 32.0f; }
+
 	// Hillshade constants (all INI tunable).
 	struct ShadeParams
 	{

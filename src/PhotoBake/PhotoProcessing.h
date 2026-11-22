@@ -13,10 +13,16 @@
 namespace MM::BakeImage
 {
 	inline constexpr int   kTileSize = 512;       // output tile side, px
-	inline constexpr int   kBlockCells = 2;       // cells per photo side; the photo is centred on the block
-	inline constexpr int   kSampleSize = 64;      // per-cell size used to fit the colour match
-	inline constexpr float kCameraHeight = 115000.0f;  // camera above the ground under the block centre
-	inline constexpr float kBaseFovDeg = 7.7f;    // horizontal FOV at 16:9: a 2x2 block fits the picture height
+	inline constexpr int   kSampleSize = 64;      // per-cell size used to fit the colour match (reference px per cell)
+	inline constexpr float kCameraHeight = 115000.0f;  // camera above the ground under the centre of a 2x2 block
+	inline constexpr float kBaseFovDeg = 7.7f;    // horizontal FOV at 16:9: a 2x2 block fits the picture height at kCameraHeight
+
+	// The photo grid (cells per photo side, 1..4) sets the block each photo covers; the photo is centred on it.
+	// Camera height grows with the grid at the same FOV, so the block always fits the picture height.
+	float CameraHeight(int a_grid);
+
+	// Side of the reference render of one block: kSampleSize px per cell.
+	int ReferenceSize(int a_grid);
 
 	// RGB, 0..255 floats, row 0 = top (north).
 	struct RgbImage
@@ -39,12 +45,15 @@ namespace MM::BakeImage
 	// FOV for the bake on this screen: 7.7 at 16:9 or narrower; wider screens get more so the block still fits the height.
 	float BakeFovDeg(int a_w, int a_h);
 
-	// World units per photo pixel for this width and FOV.
-	double UnitsPerPixel(int a_w, float a_fovDeg);
+	// World units per photo pixel for this width, FOV and grid.
+	double UnitsPerPixel(int a_w, float a_fovDeg, int a_grid);
 
 	// One cell of a block photo resampled (Lanczos 3) to kTileSize. a_dx east, a_dy north of the block's south-west cell.
 	// Returns RGB bytes, row 0 = north.
-	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_dx, int a_dy);
+	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_grid, int a_dx, int a_dy);
+
+	// One cell (kSampleSize square, RGB bytes) of a block's RGBA reference render (ReferenceSize(a_grid) square, row 0 = north).
+	std::vector<std::uint8_t> ReferenceCell(std::span<const std::uint8_t> a_rgba, int a_grid, int a_dx, int a_dy);
 
 	// Box-filtered downscale of a square RGB byte image (a_size divisible by a_out).
 	std::vector<std::uint8_t> BoxDown(std::span<const std::uint8_t> a_rgb, int a_size, int a_out);

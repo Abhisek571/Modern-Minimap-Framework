@@ -7,9 +7,15 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "VCPKG_TARGET_TRIPLET": "x64-windows-static-md" }
+    },
+    {
+      "name": "release-vr",
+      "inherits": "release",
+      "cacheVariables": { "MM_VR_ONLY": "ON" }
     }
   ],
   "buildPresets": [
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-vr", "configurePreset": "release-vr" }
   ]
 }

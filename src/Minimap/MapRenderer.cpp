@@ -28,6 +28,8 @@ namespace MM
 			float rot[4];
 			float style[4];
 			float out[4];
+			float look[4];
+			float tint[4];
 		};
 
 		struct IconCB
@@ -559,7 +561,9 @@ namespace MM
             { a_p.size, static_cast<float>(_targetSize), a_p.offsetPx.x, a_p.offsetPx.y },
             { std::cos(a_p.mapAngle), std::sin(a_p.mapAngle), std::cos(a_p.arrowAngle), std::sin(a_p.arrowAngle) },
             { a_p.opacity, a_p.round ? 1.0f : 0.0f, hasMap ? 1.0f : 0.0f, a_p.arrowSize },
-            { a_p.linearOut ? 1.0f : 0.0f, a_p.outScale, 0.0f, 0.0f }
+            { a_p.linearOut ? 1.0f : 0.0f, a_p.outScale, 0.0f, 0.0f },
+            { a_p.look.saturation, a_p.look.contrast, 0.0f, 0.0f },
+            { a_p.look.tintR, a_p.look.tintG, a_p.look.tintB, 0.0f }
 		};
 		Upload(a_ctx, _cbOverlay.Get(), cb);
 		ID3D11ShaderResourceView* srv = hasMap ? _targetSRV.Get() : nullptr;

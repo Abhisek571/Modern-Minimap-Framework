@@ -32,7 +32,8 @@ namespace
 			MM::Hooks::RegisterInput();
 			MM::IconData::RegisterEvents();
 			MM::UI::Register();
-			MM::Bake::StartOnLoadIfRequested();
+			if (MM::Bake::Supported())
+				MM::Bake::StartOnLoadIfRequested();
 			break;
 		case SKSE::MessagingInterface::kPreLoadGame:
 		case SKSE::MessagingInterface::kPostLoadGame:
@@ -54,7 +55,10 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 	MM::Settings::Load();
 	if (!MM::Settings::Get()->enabled)
 		logger::info("disabled in ini (can be turned on from the settings menu)");
-	MM::Bake::InstallActorHooksIfRequested();  // before any plugin record is read
+	if (MM::Bake::Supported())
+		MM::Bake::InstallActorHooksIfRequested();  // before any plugin record is read
+	else
+		logger::info("Skyrim VR: experimental build, town photo bake off");
 	SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
 	return true;
 }

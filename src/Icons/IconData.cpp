@@ -202,7 +202,9 @@ namespace MM::IconData
 			RE::BSSpinLockGuard guard(a_player->GetQuestTargetsLock());
 			std::vector<std::pair<RE::TESQuest*, RE::TESQuestTarget*>> pairs;
 			for (const auto& entry : a_player->GetQuestTargets()) {
-				if (!entry.first || !entry.second)
+				// Same rule as the compass: only quests tracked in the journal. The list also holds
+				// untracked and hidden quests.
+				if (!entry.first || !entry.second || !entry.first->IsActive())
 					continue;
 				for (auto* target : *entry.second) {
 					if (target)

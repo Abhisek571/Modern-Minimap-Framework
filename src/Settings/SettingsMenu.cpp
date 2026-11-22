@@ -72,6 +72,13 @@ namespace MM::UI
 				}
 				changed |= Slider("Opacity", &v.opacity, 0.0f, 1.0f);
 				changed |= Slider("Overall brightness", &v.brightness, 0.3f, 3.0f);
+				int         style = static_cast<int>(v.style);
+				const char* styles[]{ "Natural", "Muted", "Black and white", "Parchment" };
+				ImGuiMCP::SetNextItemWidth(kWidth);
+				if (ImGuiMCP::Combo("Map style", &style, styles, 4)) {
+					v.style = static_cast<MapStyle>(style);
+					changed = true;
+				}
 				changed |= ImGuiMCP::Checkbox("Rotate with player", &v.rotateWithPlayer);
 				changed |= ImGuiMCP::Checkbox("Use camera direction", &v.useCameraYaw);
 				changed |= ImGuiMCP::Checkbox("Hide in interiors", &v.hideInInteriors);
@@ -95,6 +102,9 @@ namespace MM::UI
 				}
 				ImGuiMCP::TextDisabled("4096 units = one cell. Each step is the distance from the centre to the edge.");
 				changed |= Key("Zoom key (scan code)", &v.zoomKey);
+				changed |= ImGuiMCP::Checkbox("Auto zoom (zoom out while sprinting or riding)", &v.autoZoom);
+				changed |= Slider("Auto zoom strength", &v.autoZoomStrength, 0.25f, 3.0f);
+				ImGuiMCP::TextDisabled("Outdoors only. At a horse gallop the map shows up to 1 + strength times the zoom step.");
 				changed |= Slider("Radar zoom (interiors)", &v.radarZoomScale, 0.1f, 4.0f);
 			}
 
@@ -176,7 +186,10 @@ namespace MM::UI
 				changed |= ImGuiMCP::Checkbox("Debug log (cost line once a minute)", &v.debugLog);
 			}
 
-			if (ImGuiMCP::CollapsingHeader("Bake town photos")) {
+			if (!Bake::Supported()) {
+				if (ImGuiMCP::CollapsingHeader("Bake town photos"))
+					ImGuiMCP::TextWrapped("Not available in Skyrim VR. Use the included photos or photos baked in Skyrim SE or AE.");
+			} else if (ImGuiMCP::CollapsingHeader("Bake town photos")) {
 				static bool scanned = false;
 				if (!std::exchange(scanned, true))
 					Bake::RequestScan();
@@ -199,6 +212,16 @@ namespace MM::UI
 						Bake::RequestScan();  // recount the photos for the new area (used from the next Start)
 				}
 				ImGuiMCP::TextDisabled("1.0x covers the town itself. Higher values also photograph the land around it; 2x is roughly 4 times the photos.");
+				int gridIndex = v.bake.photoGrid - 1;
+				const char* gridNames[]{ "1x1 (sharpest)", "2x2 (default)", "3x3 (faster)", "4x4 (fastest)" };
+				ImGuiMCP::SetNextItemWidth(kWidth);
+				if (ImGuiMCP::Combo("Photo grid", &gridIndex, gridNames, 4)) {
+					v.bake.photoGrid = gridIndex + 1;
+					changed = true;
+					if (!st.running)
+						Bake::RequestScan();  // recount the photos for the new grid (used from the next Start)
+				}
+				ImGuiMCP::TextDisabled("Cells per photo. 1x1 is sharpest but takes about 4x the photos; 3x3 and 4x4 are faster with softer town detail.");
 				changed |= ImGuiMCP::Checkbox("Keep existing photo tiles (only fill gaps)", &v.bake.keepExisting);
 				if (st.found >= 0)
 					ImGuiMCP::Text("Photos found: %d, done: %d", st.found, st.done);
@@ -206,7 +229,10 @@ namespace MM::UI
 					ImGuiMCP::Text("Looking for map markers...");
 				if (st.running) {
 					const int eta = static_cast<int>(st.etaSeconds / 60.0);
-					ImGuiMCP::Text("Progress: %d / %d, about %d h %02d min left", st.done, st.found, eta / 60, eta % 60);
+					if (st.etaSeconds > 0)
+						ImGuiMCP::Text("Progress: %d / %d, about %d h %02d min left", st.done, st.found, eta / 60, eta % 60);
+					else
+						ImGuiMCP::Text("Progress: %d / %d, time left shown after the first photo", st.done, st.found);
 					ImGuiMCP::Text("Now: %s", st.phase.c_str());
 				}
 				if (!st.tone.empty())

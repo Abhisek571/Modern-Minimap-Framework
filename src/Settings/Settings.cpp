@@ -1,6 +1,7 @@
 #include "PCH.h"
 
 #include "Settings.h"
+#include "BakePlan.h"
 #include "Icons.h"
 
 #include <SimpleIni.h>
@@ -38,6 +39,9 @@ namespace MM::Settings
 			ClampF(a_v.floorAbove, 0.0f, 4000.0f, d.floorAbove);
 			ClampF(a_v.otherFloorAlpha, 0.0f, 1.0f, d.otherFloorAlpha);
 			ClampF(a_v.radarZoomScale, 0.1f, 4.0f, d.radarZoomScale);
+			ClampF(a_v.autoZoomStrength, 0.25f, 3.0f, d.autoZoomStrength);
+			if (static_cast<int>(a_v.style) < 0 || a_v.style >= MapStyle::kCount)
+				a_v.style = d.style;
 			a_v.cacheMB = std::clamp(a_v.cacheMB, 4, 512);
 			a_v.colorMode = std::clamp(a_v.colorMode, 0, 2);
 			ClampF(a_v.hdrBrightness, 0.1f, 10.0f, d.hdrBrightness);
@@ -65,6 +69,7 @@ namespace MM::Settings
 			ClampF(a_v.icons.scale, 0.25f, 4.0f, d.icons.scale);
 			ClampF(a_v.bake.settleSeconds, 2.0f, 60.0f, d.bake.settleSeconds);
 			ClampF(a_v.bake.areaScale, 0.5f, 4.0f, d.bake.areaScale);
+			a_v.bake.photoGrid = BakePlan::ClampGrid(a_v.bake.photoGrid);
 		}
 
 		void ApplyLogLevel(bool a_debug)
@@ -190,6 +195,11 @@ namespace MM::Settings
 		i("General", "iColorMode", v.colorMode);
 		f("General", "fHdrBrightness", v.hdrBrightness);
 		f("General", "fRadarZoomScale", v.radarZoomScale);
+		int style = static_cast<int>(v.style);
+		i("General", "iMapStyle", style);
+		v.style = static_cast<MapStyle>(style);  // range checked in Clamp
+		b("Zoom", "bAutoZoom", v.autoZoom);
+		f("Zoom", "fAutoZoomStrength", v.autoZoomStrength);
 		f("Interior", "fFloorBelow", v.floorBelow);
 		f("Interior", "fFloorAbove", v.floorAbove);
 		f("Interior", "fOtherFloorAlpha", v.otherFloorAlpha);
@@ -239,6 +249,7 @@ namespace MM::Settings
 		f("Bake", "fSettleSeconds", v.bake.settleSeconds);
 		f("Bake", "fAreaScale", v.bake.areaScale);
 		b("Bake", "bKeepExistingTiles", v.bake.keepExisting);
+		i("Bake", "iPhotoGrid", v.bake.photoGrid);
 
 		Set(std::move(v));
 		const auto now = Get();
@@ -275,6 +286,9 @@ namespace MM::Settings
 		i("General", "iColorMode", v.colorMode);
 		f("General", "fHdrBrightness", v.hdrBrightness);
 		f("General", "fRadarZoomScale", v.radarZoomScale);
+		i("General", "iMapStyle", static_cast<long>(v.style));
+		b("Zoom", "bAutoZoom", v.autoZoom);
+		f("Zoom", "fAutoZoomStrength", v.autoZoomStrength);
 		f("Interior", "fFloorBelow", v.floorBelow);
 		f("Interior", "fFloorAbove", v.floorAbove);
 		f("Interior", "fOtherFloorAlpha", v.otherFloorAlpha);
@@ -319,6 +333,7 @@ namespace MM::Settings
 		f("Bake", "fSettleSeconds", v.bake.settleSeconds);
 		f("Bake", "fAreaScale", v.bake.areaScale);
 		b("Bake", "bKeepExistingTiles", v.bake.keepExisting);
+		i("Bake", "iPhotoGrid", v.bake.photoGrid);
 
 		const bool ok = ini.SaveFile(kPath) >= 0;
 		if (ok)
@@ -344,21 +359,36 @@ namespace MM::Settings
 		return on;
 	}
 
-	bool BakeStartOnLoadRequested()
+	namespace
 	{
-		CSimpleIniA ini;
-		ini.SetUnicode();
-		return ini.LoadFile(kPath) >= 0 && ini.GetBoolValue("Bake", "bStartOnLoad", false);
+		bool BakeKey(const char* a_key)
+		{
+			CSimpleIniA ini;
+			ini.SetUnicode();
+			return ini.LoadFile(kPath) >= 0 && ini.GetBoolValue("Bake", a_key, false);
+		}
 	}
+
+	bool BakeStartOnLoadRequested() { return BakeKey("bStartOnLoad"); }
+	bool BakeEnterFromMainMenuRequested() { return BakeKey("bEnterFromMainMenu"); }
+	bool BakeQuitWhenDoneRequested() { return BakeKey("bQuitWhenDone"); }
 
 	void ClearBakeStartOnLoad()
 	{
 		CSimpleIniA ini;
 		ini.SetUnicode();
-		if (ini.LoadFile(kPath) < 0 || !ini.GetBoolValue("Bake", "bStartOnLoad", false))
+		if (ini.LoadFile(kPath) < 0)
 			return;
-		ini.SetBoolValue("Bake", "bStartOnLoad", false);
-		if (ini.SaveFile(kPath) < 0)
+		// Only rewrite the file when something is on, so a normal bake from the settings page leaves it alone.
+		constexpr const char* kKeys[]{ "bStartOnLoad", "bEnterFromMainMenu", "bQuitWhenDone" };
+		bool                  changed = false;
+		for (const char* key : kKeys) {
+			if (ini.GetBoolValue("Bake", key, false)) {
+				ini.SetBoolValue("Bake", key, false);
+				changed = true;
+			}
+		}
+		if (changed && ini.SaveFile(kPath) < 0)
 			logger::error("could not write {}", kPath);
 	}
 
