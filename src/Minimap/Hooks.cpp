@@ -123,9 +123,19 @@ namespace MM::Hooks
 					if (e->GetEventType() != RE::INPUT_EVENT_TYPE::kButton || e->GetDevice() != RE::INPUT_DEVICE::kKeyboard)
 						continue;
 					const auto* button = e->AsButtonEvent();
-					if (!button || !button->IsDown())
+					if (!button)
 						continue;
 					const auto key = button->GetIDCode();
+					if (cfg.holdZoomKey != 0 && key == cfg.holdZoomKey) {
+						// Release always ends it (even in a menu); press only counts with a clear HUD.
+						if (button->IsUp())
+							Minimap::SetHoldZoom(false);
+						else if (button->IsDown() && Minimap::HudIsClear())
+							Minimap::SetHoldZoom(true);
+						continue;
+					}
+					if (!button->IsDown())
+						continue;
 					if ((key == cfg.zoomKey || key == cfg.hideKey) && Minimap::HudIsClear()) {
 						if (key == cfg.zoomKey)
 							Minimap::CycleZoom();

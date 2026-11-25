@@ -139,6 +139,47 @@ namespace MM::BakeImage
 		}
 	}
 
+	namespace
+	{
+		// One pixel of a supported back buffer row -> RGB 0..255 display values.
+		void DecodePixel(const std::uint8_t* a_row, int a_x, DXGI_FORMAT a_format, float* a_out)
+		{
+			switch (a_format) {
+			case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+			case DXGI_FORMAT_R8G8B8A8_UNORM:
+			case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+				a_out[0] = a_row[a_x * 4 + 0];
+				a_out[1] = a_row[a_x * 4 + 1];
+				a_out[2] = a_row[a_x * 4 + 2];
+				break;
+			case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+			case DXGI_FORMAT_R10G10B10A2_UNORM:
+				{
+					std::uint32_t v;
+					std::memcpy(&v, a_row + a_x * 4, 4);
+					a_out[0] = static_cast<float>(v & 1023) * (255.0f / 1023.0f);
+					a_out[1] = static_cast<float>((v >> 10) & 1023) * (255.0f / 1023.0f);
+					a_out[2] = static_cast<float>((v >> 20) & 1023) * (255.0f / 1023.0f);
+				}
+				break;
+			case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+			case DXGI_FORMAT_R16G16B16A16_FLOAT:
+				{
+					std::uint16_t h[3];
+					std::memcpy(h, a_row + a_x * 8, 6);
+					for (int c = 0; c < 3; ++c)
+						a_out[c] = LinearToSrgb255(HalfToFloat(h[c]));
+				}
+				break;
+			default:  // the B8G8R8A8 / B8G8R8X8 family
+				a_out[0] = a_row[a_x * 4 + 2];
+				a_out[1] = a_row[a_x * 4 + 1];
+				a_out[2] = a_row[a_x * 4 + 0];
+				break;
+			}
+		}
+	}
+
 	bool ConvertPhoto(const std::uint8_t* a_data, int a_w, int a_h, std::size_t a_rowPitch, DXGI_FORMAT a_format, RgbImage& a_out)
 	{
 		if (!a_data || a_w <= 0 || a_h <= 0 || !IsSupportedFormat(a_format))
@@ -149,43 +190,44 @@ namespace MM::BakeImage
 		float* o = a_out.px.data();
 		for (int y = 0; y < a_h; ++y) {
 			const std::uint8_t* row = a_data + a_rowPitch * static_cast<std::size_t>(y);
-			for (int x = 0; x < a_w; ++x, o += 3) {
-				switch (a_format) {
-				case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-				case DXGI_FORMAT_R8G8B8A8_UNORM:
-				case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-					o[0] = row[x * 4 + 0];
-					o[1] = row[x * 4 + 1];
-					o[2] = row[x * 4 + 2];
-					break;
-				case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-				case DXGI_FORMAT_R10G10B10A2_UNORM:
-					{
-						std::uint32_t v;
-						std::memcpy(&v, row + x * 4, 4);
-						o[0] = static_cast<float>(v & 1023) * (255.0f / 1023.0f);
-						o[1] = static_cast<float>((v >> 10) & 1023) * (255.0f / 1023.0f);
-						o[2] = static_cast<float>((v >> 20) & 1023) * (255.0f / 1023.0f);
-					}
-					break;
-				case DXGI_FORMAT_R16G16B16A16_TYPELESS:
-				case DXGI_FORMAT_R16G16B16A16_FLOAT:
-					{
-						std::uint16_t h[3];
-						std::memcpy(h, row + x * 8, 6);
-						for (int c = 0; c < 3; ++c)
-							o[c] = LinearToSrgb255(HalfToFloat(h[c]));
-					}
-					break;
-				default:  // the B8G8R8A8 / B8G8R8X8 family
-					o[0] = row[x * 4 + 2];
-					o[1] = row[x * 4 + 1];
-					o[2] = row[x * 4 + 0];
-					break;
-				}
-			}
+			for (int x = 0; x < a_w; ++x, o += 3)
+				DecodePixel(row, x, a_format, o);
 		}
 		return true;
+	}
+
+	std::vector<float> LumaThumbnail(const std::uint8_t* a_data, int a_w, int a_h, std::size_t a_rowPitch, DXGI_FORMAT a_format, int a_size)
+	{
+		if (!a_data || a_w <= 0 || a_h <= 0 || a_size <= 0 || !IsSupportedFormat(a_format))
+			return {};
+		constexpr int      kSamplesPerSide = 4;  // per thumbnail pixel: 4 x 4 photo pixels averaged
+		const int          side = std::min(a_w, a_h);
+		const int          x0 = (a_w - side) / 2, y0 = (a_h - side) / 2;
+		const int          samples = a_size * kSamplesPerSide;
+		std::vector<float> thumb(static_cast<std::size_t>(a_size) * a_size, 0.0f);
+		for (int sy = 0; sy < samples; ++sy) {
+			const int           py = y0 + static_cast<int>((static_cast<long long>(sy) * 2 + 1) * side / (samples * 2));
+			const std::uint8_t* row = a_data + a_rowPitch * static_cast<std::size_t>(py);
+			for (int sx = 0; sx < samples; ++sx) {
+				const int px = x0 + static_cast<int>((static_cast<long long>(sx) * 2 + 1) * side / (samples * 2));
+				float     rgb[3];
+				DecodePixel(row, px, a_format, rgb);
+				thumb[static_cast<std::size_t>(sy / kSamplesPerSide) * a_size + sx / kSamplesPerSide] += rgb[0] * kLuma[0] + rgb[1] * kLuma[1] + rgb[2] * kLuma[2];
+			}
+		}
+		for (auto& v : thumb)
+			v /= static_cast<float>(kSamplesPerSide * kSamplesPerSide);
+		return thumb;
+	}
+
+	float MeanAbsDiff(std::span<const float> a_lhs, std::span<const float> a_rhs)
+	{
+		if (a_lhs.empty() || a_lhs.size() != a_rhs.size())
+			return -1.0f;
+		double sum = 0;
+		for (std::size_t i = 0; i < a_lhs.size(); ++i)
+			sum += std::abs(a_lhs[i] - a_rhs[i]);
+		return static_cast<float>(sum / static_cast<double>(a_lhs.size()));
 	}
 
 	float CentreContrast(const RgbImage& a_img)
@@ -207,6 +249,46 @@ namespace MM::BakeImage
 		return static_cast<float>(std::sqrt(std::max(0.0, sum2 / static_cast<double>(n) - mean * mean)));
 	}
 
+	float ReferenceContrast(std::span<const std::uint8_t> a_rgba, int a_size)
+	{
+		if (a_size <= 0 || a_rgba.size() < static_cast<std::size_t>(a_size) * a_size * 4)
+			return -1.0f;
+		RgbImage img;
+		img.w = img.h = a_size;
+		img.px.resize(static_cast<std::size_t>(a_size) * a_size * 3);
+		for (std::size_t p = 0; p < static_cast<std::size_t>(a_size) * a_size; ++p)
+			for (int c = 0; c < 3; ++c)
+				img.px[p * 3 + c] = a_rgba[p * 4 + c];
+		return CentreContrast(img);
+	}
+
+	bool NeedsReferenceContrast(float a_photo) { return a_photo >= kEmptyContrast && a_photo < kFlatContrast; }
+
+	ContrastVerdict JudgeContrast(float a_photo, float a_reference)
+	{
+		if (a_photo < 0.0f || a_photo >= kFlatContrast)
+			return ContrastVerdict::kKeep;  // no contrast measured (the photo could not be read) is not a reason to drop it
+		if (a_photo < kEmptyContrast)
+			return ContrastVerdict::kEmpty;
+		if (a_reference >= 0.0f && a_photo >= a_reference * kPlainGroundRatio)
+			return ContrastVerdict::kKeep;  // plain snow, ice or sand: the reference is plain there too
+		return ContrastVerdict::kFlat;
+	}
+
+	float ClippedWhiteFraction(const RgbImage& a_img)
+	{
+		const std::size_t pixels = static_cast<std::size_t>(std::max(a_img.w, 0)) * static_cast<std::size_t>(std::max(a_img.h, 0));
+		if (pixels == 0 || a_img.px.size() < pixels * 3)
+			return 0.0f;
+		std::size_t clipped = 0;
+		for (std::size_t p = 0; p < pixels; ++p) {
+			const float* c = a_img.px.data() + p * 3;
+			if (c[0] * kLuma[0] + c[1] * kLuma[1] + c[2] * kLuma[2] >= kClippedLuma)
+				++clipped;
+		}
+		return static_cast<float>(static_cast<double>(clipped) / static_cast<double>(pixels));
+	}
+
 	float BakeFovDeg(int a_w, int a_h)
 	{
 		const double aspect = a_h > 0 ? static_cast<double>(a_w) / a_h : 16.0 / 9.0;
@@ -214,6 +296,16 @@ namespace MM::BakeImage
 		const double half = std::atan(std::tan(kBaseFovDeg * std::numbers::pi / 360.0) * widen);
 		return static_cast<float>(half * 360.0 / std::numbers::pi);
 	}
+
+	int ClampTileSize(int a_size)
+	{
+		int size = kMinTileSize;
+		while (size * 2 <= std::min(a_size, kMaxTileSize))
+			size *= 2;
+		return size;
+	}
+
+	float ClampPhotoExposure(float a_exposure) { return std::isfinite(a_exposure) ? std::clamp(a_exposure, 0.25f, 1.0f) : 1.0f; }
 
 	float CameraHeight(int a_grid) { return kCameraHeight * static_cast<float>(a_grid) / 2.0f; }
 
@@ -224,15 +316,19 @@ namespace MM::BakeImage
 		return 2.0 * CameraHeight(a_grid) * std::tan(a_fovDeg * std::numbers::pi / 360.0) / std::max(a_w, 1);
 	}
 
-	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_grid, int a_dx, int a_dy)
+	double PhotoPixelsPerCell(int a_w, float a_fovDeg, int a_grid) { return kCellUnits / UnitsPerPixel(a_w, a_fovDeg, a_grid); }
+
+	bool TooFewPixelsPerCell(int a_w, float a_fovDeg, int a_grid, int a_tileSize) { return a_w > 0 && PhotoPixelsPerCell(a_w, a_fovDeg, a_grid) < a_tileSize; }
+
+	std::vector<std::uint8_t> CropCell(const RgbImage& a_photo, float a_fovDeg, int a_grid, int a_dx, int a_dy, int a_tileSize)
 	{
 		// The block's south-west corner sits half a block left of and below the picture centre.
-		const double cellPx = kCellUnits / UnitsPerPixel(a_photo.w, a_fovDeg, a_grid);
+		const double cellPx = PhotoPixelsPerCell(a_photo.w, a_fovDeg, a_grid);
 		const double x0 = a_photo.w / 2.0 - a_grid * cellPx / 2 + a_dx * cellPx;
 		const double y1 = a_photo.h / 2.0 + a_grid * cellPx / 2 - a_dy * cellPx;  // south edge of the cell
 		const double y0 = y1 - cellPx;
-		const auto   tx = AxisTaps(x0, x0 + cellPx, kTileSize, a_photo.w);
-		const auto   ty = AxisTaps(y0, y1, kTileSize, a_photo.h);
+		const auto   tx = AxisTaps(x0, x0 + cellPx, a_tileSize, a_photo.w);
+		const auto   ty = AxisTaps(y0, y1, a_tileSize, a_photo.h);
 
 		// Horizontal pass over the source rows the vertical taps need, then the vertical pass.
 		int rowLo = a_photo.h, rowHi = -1;
@@ -240,15 +336,15 @@ namespace MM::BakeImage
 			rowLo = std::min(rowLo, t.first);
 			rowHi = std::max(rowHi, t.first + static_cast<int>(t.w.size()) - 1);
 		}
-		std::vector<std::uint8_t> out(static_cast<std::size_t>(kTileSize) * kTileSize * 3, 0);
+		std::vector<std::uint8_t> out(static_cast<std::size_t>(a_tileSize) * a_tileSize * 3, 0);
 		if (rowHi < rowLo)
 			return out;
 		const int          rows = rowHi - rowLo + 1;
-		std::vector<float> mid(static_cast<std::size_t>(rows) * kTileSize * 3, 0.0f);
+		std::vector<float> mid(static_cast<std::size_t>(rows) * a_tileSize * 3, 0.0f);
 		for (int r = 0; r < rows; ++r) {
 			const float* src = a_photo.px.data() + static_cast<std::size_t>(rowLo + r) * a_photo.w * 3;
-			float*       dst = mid.data() + static_cast<std::size_t>(r) * kTileSize * 3;
-			for (int i = 0; i < kTileSize; ++i) {
+			float*       dst = mid.data() + static_cast<std::size_t>(r) * a_tileSize * 3;
+			for (int i = 0; i < a_tileSize; ++i) {
 				const auto& t = tx[static_cast<std::size_t>(i)];
 				float       c[3]{};
 				for (std::size_t k = 0; k < t.w.size(); ++k) {
@@ -262,17 +358,17 @@ namespace MM::BakeImage
 				dst[i * 3 + 2] = c[2];
 			}
 		}
-		for (int j = 0; j < kTileSize; ++j) {
+		for (int j = 0; j < a_tileSize; ++j) {
 			const auto& t = ty[static_cast<std::size_t>(j)];
-			for (int i = 0; i < kTileSize; ++i) {
+			for (int i = 0; i < a_tileSize; ++i) {
 				float c[3]{};
 				for (std::size_t k = 0; k < t.w.size(); ++k) {
-					const float* p = mid.data() + ((static_cast<std::size_t>(t.first - rowLo) + k) * kTileSize + i) * 3;
+					const float* p = mid.data() + ((static_cast<std::size_t>(t.first - rowLo) + k) * a_tileSize + i) * 3;
 					c[0] += p[0] * t.w[k];
 					c[1] += p[1] * t.w[k];
 					c[2] += p[2] * t.w[k];
 				}
-				auto* o = out.data() + (static_cast<std::size_t>(j) * kTileSize + i) * 3;
+				auto* o = out.data() + (static_cast<std::size_t>(j) * a_tileSize + i) * 3;
 				for (int ch = 0; ch < 3; ++ch)
 					o[ch] = static_cast<std::uint8_t>(std::clamp(std::lround(c[ch]), 0L, 255L));
 			}
@@ -321,6 +417,18 @@ namespace MM::BakeImage
 			}
 		}
 		return out;
+	}
+
+	void CapHighlights(std::array<float, 256>& a_lut)
+	{
+		constexpr float knee = static_cast<float>(kHighlightKnee);
+		const float     kneeOut = std::min(a_lut[kHighlightKnee], knee + (255.0f - knee) / 2.0f);
+		for (int v = 0; v < kHighlightKnee; ++v)
+			a_lut[v] = std::min(a_lut[v], kneeOut);  // keeps the curve monotonic when the knee was lowered
+		for (int v = kHighlightKnee; v < 256; ++v) {
+			const float line = kneeOut + (255.0f - kneeOut) * (static_cast<float>(v) - knee) / (255.0f - knee);
+			a_lut[v] = std::min(a_lut[v], line);
+		}
 	}
 
 	Tone FitMatch(std::span<const std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> a_pairs)
@@ -379,6 +487,7 @@ namespace MM::BakeImage
 			}
 			tone.lut[v] = y;
 		}
+		CapHighlights(tone.lut);
 		const double n = static_cast<double>(ya.size());
 		const double meanYa = std::max(sumYa / n, 1e-3), meanYb = std::max(sumYb / n, 1e-3);
 		for (int c = 0; c < 3; ++c) {
@@ -563,6 +672,34 @@ namespace MM::BakeImage
 			}
 			level = std::move(next);
 			size = half;
+		}
+		return out;
+	}
+
+	std::vector<std::uint8_t> EncodeBmp24(std::span<const std::uint8_t> a_rgb, int a_w, int a_h)
+	{
+		const int                 row = (a_w * 3 + 3) & ~3;  // rows are padded to 4 bytes
+		std::vector<std::uint8_t> out(54 + static_cast<std::size_t>(row) * a_h, 0);
+		if (a_w <= 0 || a_h <= 0 || a_rgb.size() < static_cast<std::size_t>(a_w) * a_h * 3)
+			return {};
+		const auto put = [&](std::size_t a_at, std::uint32_t a_v) { std::memcpy(out.data() + a_at, &a_v, 4); };
+		out[0] = 'B';
+		out[1] = 'M';
+		put(2, static_cast<std::uint32_t>(out.size()));
+		put(10, 54);  // pixel data offset
+		put(14, 40);  // BITMAPINFOHEADER size
+		put(18, static_cast<std::uint32_t>(a_w));
+		put(22, static_cast<std::uint32_t>(a_h));  // positive height: bottom row first
+		out[26] = 1;   // planes
+		out[28] = 24;  // bits per pixel
+		for (int y = 0; y < a_h; ++y) {
+			const auto* src = a_rgb.data() + static_cast<std::size_t>(y) * a_w * 3;
+			auto*       dst = out.data() + 54 + static_cast<std::size_t>(a_h - 1 - y) * row;
+			for (int x = 0; x < a_w; ++x) {
+				dst[x * 3 + 0] = src[x * 3 + 2];
+				dst[x * 3 + 1] = src[x * 3 + 1];
+				dst[x * 3 + 2] = src[x * 3 + 0];
+			}
 		}
 		return out;
 	}

@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.21)
 
 project(ModernMinimap VERSION 0.1.0 LANGUAGES CXX)
 
@@ -11,6 +11,7 @@ file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}/" MM_SOURCE_ROOT)
 add_compile_options("/d1trimfile:${MM_SOURCE_ROOT}")
 
 find_package(directxtk CONFIG REQUIRED)
+find_package(directxtex CONFIG REQUIRED)  # Photo Baker app only (BC7 encoding)
 
 set(MM_WARNINGS /W4 /permissive- /external:anglebrackets /external:W0)
 set(MM_DEFINES WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -27,6 +28,7 @@ set(MM_SOURCE_DIRS src src/Minimap src/Terrain src/Interiors src/Icons src/Photo
 # The parts with no game types (maths, mesh reading, drawing, image processing): shared by the plugin and the test tool.
 add_library(MinimapCore STATIC
 	src/Minimap/MapMath.cpp
+	src/Minimap/FogOfWar.cpp
 	src/Minimap/TileCache.cpp
 	src/Minimap/MapRenderer.cpp
 	src/Terrain/TerrainMesh.cpp
@@ -62,6 +64,7 @@ add_commonlibsse_plugin(${PROJECT_NAME}
 		src/main.cpp
 		src/Minimap/Minimap.cpp
 		src/Minimap/Hooks.cpp
+		src/Minimap/FogState.cpp
 		src/Icons/IconData.cpp
 		src/PhotoBake/PhotoBake.cpp
 		src/Settings/Settings.cpp
@@ -79,21 +82,32 @@ if(MM_VR_ONLY)
 endif()
 
 # Offline test tool: maths, btr parsing against real tiles, and a render of the tile pass to PNG.
-add_executable(ModernMinimapTests tests/TestMain.cpp)
+# Also checks the Photo Baker app's pure helpers (TileFormats, BakeRules, MasterTone: no window or DirectXTex code).
+add_executable(ModernMinimapTests tests/TestMain.cpp src/PhotoBakerApp/TileFormats.cpp src/PhotoBakerApp/BakeRules.cpp src/PhotoBakerApp/MasterTone.cpp)
+target_include_directories(ModernMinimapTests PRIVATE src/PhotoBakerApp)
 target_compile_options(ModernMinimapTests PRIVATE ${MM_WARNINGS} /utf-8)
 target_link_libraries(ModernMinimapTests PRIVATE MinimapCore windowscodecs ole32)
 
 # Photo Baker: small Windows app that runs the plugin's town photo bake unattended (own zip in package.ps1).
 # Plain Win32, static runtime: a single exe the player can drop anywhere and add to MO2's executables list.
 configure_file(src/PhotoBakerApp/Version.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/PhotoBakerVersion.h @ONLY)
+file(GLOB MM_BAKER_SOURCES CONFIGURE_DEPENDS src/PhotoBakerApp/*.cpp)
 add_executable(ModernMinimapPhotoBaker WIN32
-	src/PhotoBakerApp/PhotoBakerApp.cpp
-	src/PhotoBakerApp/BakerFiles.cpp
+	${MM_BAKER_SOURCES}
+	src/PhotoBake/PhotoProcessing.cpp  # the plugin's tone maths (pure CPU code), so master tiles match its BC1 tiles
 	src/PhotoBakerApp/PhotoBakerApp.rc
 	src/PhotoBakerApp/PhotoBakerApp.manifest
 )
 set_property(TARGET ModernMinimapPhotoBaker PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-target_include_directories(ModernMinimapPhotoBaker PRIVATE src/PhotoBakerApp ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_include_directories(ModernMinimapPhotoBaker PRIVATE src/PhotoBakerApp src/Minimap ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_definitions(ModernMinimapPhotoBaker PRIVATE ${MM_DEFINES})
 target_compile_options(ModernMinimapPhotoBaker PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${MM_WARNINGS};/utf-8>")
-target_link_libraries(ModernMinimapPhotoBaker PRIVATE comctl32 ole32 shell32 advapi32)
+target_link_libraries(ModernMinimapPhotoBaker PRIVATE comctl32 ole32 shell32 advapi32 Microsoft::DirectXTex d3d11)
+
+# Bake-only helper (never packaged): stops non-player actors loading 3D during the town photo bake.
+add_commonlibsse_plugin(MinimapBakeNoActors
+	AUTHOR "itsPigeon2000"
+	SOURCES tools/bake/noactors/main.cpp
+)
+target_compile_options(MinimapBakeNoActors PRIVATE /Zc:preprocessor /utf-8)
+target_precompile_headers(MinimapBakeNoActors PRIVATE src/PCH.h)

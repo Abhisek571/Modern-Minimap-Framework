@@ -1,7 +1,8 @@
 #pragma once
 
 // In-game town photo bake: flies a straight-down free camera over every settlement found from the load order's
-// map markers, captures the back buffer and writes finished 512 px BC1 tiles to Data\textures\ModernMinimap\tamriel.
+// map markers (or every Tamriel cell with land, [Bake] bFullMap), captures the back buffer and writes finished BC1
+// tiles (512 px by default, [Bake] iTileSize) to Data\textures\ModernMinimap\tamriel.
 // Needs no outside tools.
 
 namespace MM::Bake
@@ -33,11 +34,12 @@ namespace MM::Bake
 		bool        writing{ false };  // tiles still being encoded / written
 		int         found{ -1 };       // shots in the list (-1 = not scanned yet)
 		int         done{ 0 };         // shots finished, earlier runs included
+		int         failedCells{ 0 };  // cells of failed shots: queued for the retry pass, after it the ones still missing
 		double      etaSeconds{ 0 };
 		std::string phase;
 		std::string tone;
 		std::string message;
-		std::string state;  // for the status file: "starting", "done", "cancelled", "error"; empty = running / writing
+		std::string state;  // for the status file: "starting", "done", "cancelled", "error", "restart"; empty = running / writing
 	};
 	Status GetStatus();
 }

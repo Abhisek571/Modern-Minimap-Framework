@@ -24,12 +24,22 @@ namespace MM
 		ID3D11ShaderResourceView* water{ nullptr };   // optional
 	};
 
+	// Fog of war in the tile compose: the mask set with SetFogMask covers a world rect; unexplored land is darkened.
+	struct FogParams
+	{
+		bool  enabled{ false };
+		Rect  world;               // world rect of the whole mask
+		float darkness{ 0.5f };    // 0 = no change, 1 = black
+		bool  inTowns{ false };    // also over the baked town photos
+	};
+
 	struct ComposeParams
 	{
 		Vec2        center;           // world point at the target centre
 		float       unitsPerPixel{ 32.0f };
 		int         targetSize{ 512 };
 		ShadeParams shade;
+		FogParams   fog;
 	};
 
 	// Interior map: navmesh floor and walls, centred on the player like the tile compose.
@@ -121,6 +131,9 @@ namespace MM
 		// Draws the given tiles into the compose target (resized as needed). Leaves the target bound.
 		void Compose(ID3D11DeviceContext* a_ctx, const ComposeParams& a_params, std::span<const TileDraw> a_tiles);
 
+		// Fog of war mask (R8, a_size x a_size, row 0 = north). Created on first use, then updated in place.
+		bool SetFogMask(ID3D11DeviceContext* a_ctx, std::span<const std::uint8_t> a_pixels, int a_size);
+
 		// Interior map pipeline. Its failure leaves the rest working (interiors then show the plain radar disc).
 		[[nodiscard]] bool               NavReady() const noexcept { return _psNav != nullptr; }
 		[[nodiscard]] const std::string& NavError() const noexcept { return _navError; }
@@ -138,7 +151,7 @@ namespace MM
 		// All icons in one instanced draw into whatever render target is bound now (call after DrawOverlay).
 		void DrawIcons(ID3D11DeviceContext* a_ctx, const IconPassParams& a_params, std::span<const IconInstance> a_icons);
 
-		static constexpr UINT kMaxIcons = 1024;
+		static constexpr UINT kMaxIcons = 2048;
 
 		[[nodiscard]] ID3D11Texture2D* AtlasTexture() const noexcept { return _atlas.Get(); }
 		[[nodiscard]] ID3D11Texture2D* ComposeTexture() const noexcept { return _target.Get(); }
@@ -168,6 +181,9 @@ namespace MM
 		ComPtr<ID3D11RenderTargetView>   _targetRTV;
 		ComPtr<ID3D11ShaderResourceView> _targetSRV;
 		int                              _targetSize{ 0 };
+		ComPtr<ID3D11Texture2D>          _fog;
+		ComPtr<ID3D11ShaderResourceView> _fogSRV;
+		int                              _fogSize{ 0 };
 
 		ComPtr<ID3D11VertexShader>       _vsNav, _vsNavWall;
 		ComPtr<ID3D11PixelShader>        _psNav;

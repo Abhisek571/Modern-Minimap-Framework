@@ -13,6 +13,7 @@ namespace MM::Minimap
 
 	void CycleZoom();
 	void ToggleHidden();
+	void SetHoldZoom(bool a_held);  // hold-to-zoom-out key down / up
 
 	// Town photo bake: no minimap in the picture while it is taken.
 	void SetSuppressed(bool a_suppressed);

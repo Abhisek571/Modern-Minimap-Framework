@@ -1,6 +1,7 @@
 #include "PCH.h"
 
 #include "PhotoBake.h"
+#include "FogState.h"
 #include "Hooks.h"
 #include "IconData.h"
 #include "Minimap.h"
@@ -59,6 +60,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 		MM::Bake::InstallActorHooksIfRequested();  // before any plugin record is read
 	else
 		logger::info("Skyrim VR: experimental build, town photo bake off");
+	MM::FogState::RegisterSerialization();
 	SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
 	return true;
 }

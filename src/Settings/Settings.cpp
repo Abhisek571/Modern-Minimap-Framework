@@ -3,6 +3,7 @@
 #include "Settings.h"
 #include "BakePlan.h"
 #include "Icons.h"
+#include "PhotoProcessing.h"
 
 #include <SimpleIni.h>
 
@@ -47,6 +48,8 @@ namespace MM::Settings
 			ClampF(a_v.hdrBrightness, 0.1f, 10.0f, d.hdrBrightness);
 			a_v.zoomKey = std::min<std::uint32_t>(a_v.zoomKey, 255);
 			a_v.hideKey = std::min<std::uint32_t>(a_v.hideKey, 255);
+			a_v.holdZoomKey = std::min<std::uint32_t>(a_v.holdZoomKey, 255);
+			ClampF(a_v.holdZoomFactor, kHoldZoomMin, kHoldZoomMax, d.holdZoomFactor);
 			std::erase_if(a_v.zoomRadii, [](float r) { return !std::isfinite(r) || r < 500.0f || r > 200000.0f; });
 			if (a_v.zoomRadii.empty())
 				a_v.zoomRadii = d.zoomRadii;
@@ -67,9 +70,20 @@ namespace MM::Settings
 			ClampF(s.waterAlpha, 0.0f, 1.0f, d.shade.waterAlpha);
 
 			ClampF(a_v.icons.scale, 0.25f, 4.0f, d.icons.scale);
+			ClampF(a_v.icons.undiscoveredRadius, 500.0f, 50000.0f, d.icons.undiscoveredRadius);
+			ClampF(a_v.fogDarkness, 0.0f, 1.0f, d.fogDarkness);
+			if (static_cast<int>(a_v.icons.compassLetters) >= kCompassModeCount)
+				a_v.icons.compassLetters = d.icons.compassLetters;
+			if (static_cast<int>(a_v.icons.dead) >= kDeadModeCount)
+				a_v.icons.dead = d.icons.dead;
 			ClampF(a_v.bake.settleSeconds, 2.0f, 60.0f, d.bake.settleSeconds);
+			ClampF(a_v.bake.settleMinSeconds, 0.5f, a_v.bake.settleSeconds, std::min(d.bake.settleMinSeconds, a_v.bake.settleSeconds));
+			ClampF(a_v.bake.settleThreshold, 0.05f, 20.0f, d.bake.settleThreshold);
+			// 0 = off; otherwise at least 20 photos per game start, so a typo cannot quit the game every few photos.
+			a_v.bake.restartEvery = a_v.bake.restartEvery <= 0 ? 0 : std::clamp(a_v.bake.restartEvery, 20, 100000);
 			ClampF(a_v.bake.areaScale, 0.5f, 4.0f, d.bake.areaScale);
 			a_v.bake.photoGrid = BakePlan::ClampGrid(a_v.bake.photoGrid);
+			a_v.bake.tileSize = BakeImage::ClampTileSize(a_v.bake.tileSize);
 		}
 
 		void ApplyLogLevel(bool a_debug)
@@ -123,6 +137,16 @@ namespace MM::Settings
 			{ "sDoor", &IconColors::door },
 			{ "sCustomMarker", &IconColors::custom },
 			{ "sArrow", &IconColors::arrow },
+			{ "sHorse", &IconColors::horse },
+			{ "sTrail", &IconColors::trail },
+			{ "sUndiscoveredNearby", &IconColors::nearby },
+			{ "sCompass", &IconColors::compass },
+			{ "sInfoText", &IconColors::infoText },
+			{ "sQuestDistance", &IconColors::questDistance },
+			{ "sTextOutline", &IconColors::textOutline },
+			{ "sService", &IconColors::service },
+			{ "sGuard", &IconColors::guard },
+			{ "sDragon", &IconColors::dragon },
 		};
 
 		const char* CornerName(Corner a_c)
@@ -192,6 +216,13 @@ namespace MM::Settings
 		b("General", "bUseCameraYaw", v.useCameraYaw);
 		b("General", "bHideInInteriors", v.hideInInteriors);
 		b("General", "bHideInKillCam", v.hideInKillCam);
+		b("General", "bHideInCombat", v.hideInCombat);
+		b("General", "bClock", v.clock);
+		b("General", "bLocationName", v.locationName);
+		b("General", "b24Hour", v.clock24h);
+		b("FogOfWar", "bFogOfWar", v.fogOfWar);
+		f("FogOfWar", "fFogDarkness", v.fogDarkness);
+		b("FogOfWar", "bFogInTowns", v.fogInTowns);
 		i("General", "iColorMode", v.colorMode);
 		f("General", "fHdrBrightness", v.hdrBrightness);
 		f("General", "fRadarZoomScale", v.radarZoomScale);
@@ -206,9 +237,12 @@ namespace MM::Settings
 		b("General", "bDebugLog", v.debugLog);
 		v.drawHook = ini.GetLongValue("General", "iDrawHook", 0) == 1 ? DrawHook::kPresent : DrawHook::kHudMenu;
 		i("General", "iCacheMB", v.cacheMB);
-		int hideKey = static_cast<int>(v.hideKey), zoomKey = static_cast<int>(v.zoomKey);
+		int hideKey = static_cast<int>(v.hideKey), zoomKey = static_cast<int>(v.zoomKey), holdZoomKey = static_cast<int>(v.holdZoomKey);
 		i("General", "iHideKey", hideKey);
 		i("Zoom", "iZoomKey", zoomKey);
+		i("Zoom", "iHoldZoomKey", holdZoomKey);
+		v.holdZoomKey = static_cast<std::uint32_t>(std::clamp(holdZoomKey, 0, 255));
+		f("Zoom", "fHoldZoomFactor", v.holdZoomFactor);
 		v.hideKey = static_cast<std::uint32_t>(std::clamp(hideKey, 0, 255));
 		v.zoomKey = static_cast<std::uint32_t>(std::clamp(zoomKey, 0, 255));
 		if (auto radii = ParseRadii(ini.GetValue("Zoom", "sRadii", "")); !radii.empty())
@@ -239,17 +273,40 @@ namespace MM::Settings
 		b("Icons", "bHostile", ic.hostile);
 		b("Icons", "bFollowers", ic.follower);
 		b("Icons", "bNeutral", ic.neutral);
-		b("Icons", "bDead", ic.dead);
+		// iDead replaced bDead (true = all bodies); an old file without iDead keeps working.
+		ic.dead = DeadModeFromIni(ini.GetLongValue("Icons", "iDead", -1), ini.GetBoolValue("Icons", "bDead", false));
 		b("Icons", "bCustomMarker", ic.customMarker);
+		b("Icons", "bQuestDistance", ic.questDistance);
+		// iCompassLetters replaced bCompassLetters (false = off, true = outside, the new default).
+		const char* legacyCompass = ini.GetValue("Icons", "bCompassLetters", nullptr);
+		ic.compassLetters = CompassModeFromIni(ini.GetLongValue("Icons", "iCompassLetters", -1),
+			legacyCompass ? (ini.GetBoolValue("Icons", "bCompassLetters", true) ? 1 : 0) : -1);
+		b("Icons", "bHorse", ic.horse);
+		b("Icons", "bTrail", ic.trail);
+		b("Icons", "bUndiscoveredNearby", ic.undiscoveredNearby);
+		f("Icons", "fUndiscoveredRadius", ic.undiscoveredRadius);
+		b("Icons", "bServices", ic.services);
+		b("Icons", "bDimCleared", ic.dimCleared);
 		const auto doors = std::clamp(static_cast<int>(ini.GetLongValue("Icons", "iDoors", 1)), 0, 2);
 		ic.doors = static_cast<DoorMode>(doors);
 		for (const auto& c : kColorKeys)
 			ic.colors.*c.member = ParseColor(ini.GetValue("Colors", c.key, nullptr), ic.colors.*c.member);
 
 		f("Bake", "fSettleSeconds", v.bake.settleSeconds);
+		b("Bake", "bAdaptiveSettle", v.bake.adaptiveSettle);
+		f("Bake", "fSettleMinSeconds", v.bake.settleMinSeconds);
+		f("Bake", "fSettleThreshold", v.bake.settleThreshold);
 		f("Bake", "fAreaScale", v.bake.areaScale);
 		b("Bake", "bKeepExistingTiles", v.bake.keepExisting);
 		i("Bake", "iPhotoGrid", v.bake.photoGrid);
+		b("Bake", "bFullMap", v.bake.fullMap);
+		i("Bake", "iTileSize", v.bake.tileSize);
+		b("Bake", "bSaveMasters", v.bake.saveMasters);
+		b("Bake", "bSpreadToneFit", v.bake.spreadToneFit);
+		b("Bake", "bLockExposure", v.bake.lockExposure);
+		f("Bake", "fPhotoExposure", v.bake.photoExposure);
+		i("Bake", "iRestartEvery", v.bake.restartEvery);
+		b("Bake", "bRetryFailed", v.bake.retryFailed);
 
 		Set(std::move(v));
 		const auto now = Get();
@@ -283,6 +340,13 @@ namespace MM::Settings
 		b("General", "bUseCameraYaw", v.useCameraYaw);
 		b("General", "bHideInInteriors", v.hideInInteriors);
 		b("General", "bHideInKillCam", v.hideInKillCam);
+		b("General", "bHideInCombat", v.hideInCombat);
+		b("General", "bClock", v.clock);
+		b("General", "bLocationName", v.locationName);
+		b("General", "b24Hour", v.clock24h);
+		b("FogOfWar", "bFogOfWar", v.fogOfWar);
+		f("FogOfWar", "fFogDarkness", v.fogDarkness);
+		b("FogOfWar", "bFogInTowns", v.fogInTowns);
 		i("General", "iColorMode", v.colorMode);
 		f("General", "fHdrBrightness", v.hdrBrightness);
 		f("General", "fRadarZoomScale", v.radarZoomScale);
@@ -298,6 +362,8 @@ namespace MM::Settings
 		i("General", "iDrawHook", v.drawHook == DrawHook::kPresent ? 1 : 0);
 		t("Zoom", "sRadii", FormatRadii(v.zoomRadii));
 		i("Zoom", "iZoomKey", static_cast<long>(v.zoomKey));
+		i("Zoom", "iHoldZoomKey", static_cast<long>(v.holdZoomKey));
+		f("Zoom", "fHoldZoomFactor", v.holdZoomFactor);
 
 		const auto& s = v.shade;
 		f("Shading", "fLightX", s.lightX);
@@ -324,16 +390,37 @@ namespace MM::Settings
 		b("Icons", "bHostile", ic.hostile);
 		b("Icons", "bFollowers", ic.follower);
 		b("Icons", "bNeutral", ic.neutral);
-		b("Icons", "bDead", ic.dead);
+		i("Icons", "iDead", static_cast<long>(ic.dead));
+		ini.Delete("Icons", "bDead");
 		b("Icons", "bCustomMarker", ic.customMarker);
+		b("Icons", "bQuestDistance", ic.questDistance);
+		i("Icons", "iCompassLetters", static_cast<long>(ic.compassLetters));
+		ini.Delete("Icons", "bCompassLetters");
+		b("Icons", "bHorse", ic.horse);
+		b("Icons", "bTrail", ic.trail);
+		b("Icons", "bUndiscoveredNearby", ic.undiscoveredNearby);
+		f("Icons", "fUndiscoveredRadius", ic.undiscoveredRadius);
+		b("Icons", "bServices", ic.services);
+		b("Icons", "bDimCleared", ic.dimCleared);
 		i("Icons", "iDoors", static_cast<long>(ic.doors));
 		for (const auto& c : kColorKeys)
 			t("Colors", c.key, FormatColor(ic.colors.*c.member));
 
 		f("Bake", "fSettleSeconds", v.bake.settleSeconds);
+		b("Bake", "bAdaptiveSettle", v.bake.adaptiveSettle);
+		f("Bake", "fSettleMinSeconds", v.bake.settleMinSeconds);
+		f("Bake", "fSettleThreshold", v.bake.settleThreshold);
 		f("Bake", "fAreaScale", v.bake.areaScale);
 		b("Bake", "bKeepExistingTiles", v.bake.keepExisting);
 		i("Bake", "iPhotoGrid", v.bake.photoGrid);
+		b("Bake", "bFullMap", v.bake.fullMap);
+		i("Bake", "iTileSize", v.bake.tileSize);
+		b("Bake", "bSaveMasters", v.bake.saveMasters);
+		b("Bake", "bSpreadToneFit", v.bake.spreadToneFit);
+		b("Bake", "bLockExposure", v.bake.lockExposure);
+		f("Bake", "fPhotoExposure", v.bake.photoExposure);
+		i("Bake", "iRestartEvery", v.bake.restartEvery);
+		b("Bake", "bRetryFailed", v.bake.retryFailed);
 
 		const bool ok = ini.SaveFile(kPath) >= 0;
 		if (ok)

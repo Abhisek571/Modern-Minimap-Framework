@@ -221,7 +221,7 @@ namespace PhotoBaker
 		if (!ReadSmallFile(a_path, text))
 			return false;
 		BakeStatus s;
-		double     found = -1, done = 0, eta = 0, pid = 0;
+		double     found = -1, done = 0, eta = 0, pid = 0, failedCells = 0;
 		if (!JsonString(text, "state", s.state))
 			return false;
 		JsonString(text, "phase", s.phase);
@@ -230,10 +230,12 @@ namespace PhotoBaker
 		JsonNumber(text, "done", done);
 		JsonNumber(text, "etaSeconds", eta);
 		JsonNumber(text, "pid", pid);
+		JsonNumber(text, "failedCells", failedCells);
 		s.found = static_cast<int>(found);
 		s.done = static_cast<int>(done);
 		s.etaSeconds = eta;
 		s.pid = static_cast<DWORD>(pid);
+		s.failedCells = static_cast<int>(failedCells);
 		a_out = std::move(s);
 		return true;
 	}
@@ -415,5 +417,56 @@ namespace PhotoBaker
 		} while (FindNextFileW(find, &fd));
 		FindClose(find);
 		return r;
+	}
+
+	bool ReadTextFile(const fs::path& a_path, std::string& a_out)
+	{
+		std::ifstream in(a_path, std::ios::binary);
+		if (!in)
+			return false;
+		std::ostringstream text;
+		text << in.rdbuf();
+		a_out = text.str();
+		return true;
+	}
+
+	bool WriteTextFile(const fs::path& a_path, std::string_view a_text)
+	{
+		std::error_code ec;
+		fs::create_directories(a_path.parent_path(), ec);
+		std::ofstream out(a_path, std::ios::binary | std::ios::trunc);
+		out.write(a_text.data(), static_cast<std::streamsize>(a_text.size()));
+		return static_cast<bool>(out);
+	}
+
+	std::uint64_t FileWriteTime(const fs::path& a_path)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA data{};
+		if (!GetFileAttributesExW(a_path.c_str(), GetFileExInfoStandard, &data))
+			return 0;
+		return (static_cast<std::uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+	}
+
+	void AskProcessToClose(DWORD a_pid)
+	{
+		EnumWindows(
+			[](HWND a_wnd, LPARAM a_target) {
+				DWORD pid = 0;
+				GetWindowThreadProcessId(a_wnd, &pid);
+				if (pid == static_cast<DWORD>(a_target) && GetWindow(a_wnd, GW_OWNER) == nullptr)
+					PostMessageW(a_wnd, WM_CLOSE, 0, 0);
+				return TRUE;
+			},
+			static_cast<LPARAM>(a_pid));
+	}
+
+	bool EndProcess(DWORD a_pid)
+	{
+		const HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, a_pid);
+		if (!h)
+			return false;
+		const bool ended = TerminateProcess(h, 1) != FALSE;
+		CloseHandle(h);
+		return ended;
 	}
 }

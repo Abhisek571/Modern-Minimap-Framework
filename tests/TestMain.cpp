@@ -4,6 +4,9 @@
 // Usage: ModernMinimapTests <data folder with textures\terrain and meshes\terrain> <output folder>
 
 #include "BakePlan.h"
+#include "BakeRules.h"
+#include "FogOfWar.h"
+#include "MasterTone.h"
 #include "PhotoProcessing.h"
 #include "TerrainMesh.h"
 #include "Icons.h"
@@ -11,13 +14,16 @@
 #include "MapRenderer.h"
 #include "InteriorMap.h"
 #include "TileCache.h"
+#include "TileFormats.h"
 
 #include <DDSTextureLoader.h>
 #include <ScreenGrab.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <numbers>
 #include <sstream>
 #include <wincodec.h>
@@ -196,6 +202,29 @@ namespace
 			}
 			Check(allRejectedOrOk, "truncated btr rejected");
 		}
+	}
+
+	// Whole-map bake on the real terrain LOD in the data folder: how many cells count as land.
+	void TestFullMapOnLod(const fs::path& a_data)
+	{
+		std::set<std::pair<int, int>> land;
+		int                           meshes = 0;
+		for (int ty = -64; ty < 64; ty += 4) {
+			for (int tx = -64; tx < 64; tx += 4) {
+				const TileId              id{ 4, tx, ty };
+				std::vector<std::uint8_t> bytes;
+				BtrData                   btr;
+				std::string               error;
+				if (!ReadFile(a_data, TileMeshPath("tamriel", id), bytes) || !ParseBtr(bytes, btr, error))
+					continue;
+				++meshes;
+				land.merge(BakePlan::LandCells(btr, id));
+			}
+		}
+		std::printf("whole map: %d level-4 meshes, %zu cells with land (of %d)\n", meshes, land.size(), meshes * 16);
+		if (meshes < 300)
+			return;  // not a full Tamriel terrain LOD set
+		Check(land.size() > 5000 && land.size() < static_cast<std::size_t>(meshes) * 16, "whole map: thousands of land cells, open sea left out");
 	}
 
 	bool SaveGray(ID3D11Device* a_dev, ID3D11DeviceContext* a_ctx, const std::vector<std::uint8_t>& a_pixels, int a_w, int a_h, const fs::path& a_file)
@@ -476,6 +505,9 @@ namespace
 		Check(ClassifyMapMarker(0) == MarkerClass::kOther && ClassifyMapMarker(11) == MarkerClass::kOther && ClassifyMapMarker(18) == MarkerClass::kOther &&
 				  ClassifyMapMarker(99) == MarkerClass::kOther,
 			"markers: other");
+		Check(CountsAsEnemy(true, 4.0f) && CountsAsEnemy(true, 1.0f), "actors: hostile and not cowardly is an enemy (wolf, bear)");
+		Check(!CountsAsEnemy(true, 0.0f), "actors: hostile but cowardly prey is not an enemy (rabbit, deer)");
+		Check(!CountsAsEnemy(false, 4.0f) && !CountsAsEnemy(false, 0.0f), "actors: not hostile is never an enemy");
 		Check(ShapeForMarkerClass(MarkerClass::kCity) == IconShape::kCity && ShapeForMarkerClass(MarkerClass::kDungeon) == IconShape::kCave &&
 				  ShapeForMarkerClass(MarkerClass::kSettlement) == IconShape::kHouse && ShapeForMarkerClass(MarkerClass::kOther) == IconShape::kDiamond,
 			"marker class -> shape");
@@ -543,15 +575,280 @@ namespace
 					if ((x == 0 || y == 0 || x == kAtlasCellPx - 1 || y == kAtlasCellPx - 1) && alpha > 8)
 						edgeClear = false;
 				}
-			const double frac = a / (kAtlasCellPx * kAtlasCellPx);
-			if (frac < 0.08 || frac > 0.85 || !edgeClear) {
+			const double frac = a / (kAtlasInnerPx * kAtlasInnerPx);
+			const double minFrac = s >= static_cast<int>(IconShape::kGlyphFirst) ? 0.005 : 0.08;  // glyphs such as '.' are small
+			if (frac < minFrac || frac > 0.85 || !edgeClear) {
 				std::printf("atlas cell %d: coverage %.2f, edge clear %d\n", s, frac, edgeClear);
 				covered = false;
 			}
 		}
 		Check(covered, "every icon cell drawn, with a clear border (no bleeding)");
-		const auto* centre = &img.mips[0][(static_cast<std::size_t>(32) * kAtlasSize + 32) * 4];
+		const auto* centre = &img.mips[0][(static_cast<std::size_t>(kAtlasGutterPx + 32) * kAtlasSize + kAtlasGutterPx + 32) * 4];
 		Check(centre[0] > 240 && centre[3] == 255, "circle centre is opaque white (tintable)");
+	}
+
+	// ---- timed features: pure helpers ----
+
+	void TestFeatureHelpers()
+	{
+		// Distance labels: 70 units per metre, km from 1000 m.
+		Check(FormatDistance(0) == "0m" && FormatDistance(70.0f * 45) == "45m", "distance: metres");
+		Check(FormatDistance(70.0f * 999.4f) == "999m" && FormatDistance(70.0f * 999.6f) == "1.0km", "distance: switches to km at 1000 m");
+		Check(FormatDistance(70.0f * 1234) == "1.2km" && FormatDistance(70.0f * 25260) == "25.3km", "distance: km with one decimal");
+		Check(FormatDistance(-50) == "0m", "distance: negative clamps to 0");
+
+		// Dead body mode and the old bDead key.
+		Check(DeadModeFromIni(-1, false) == DeadMode::kOff && DeadModeFromIni(-1, true) == DeadMode::kAll, "iDead missing: bDead decides (true = all)");
+		Check(DeadModeFromIni(1, true) == DeadMode::kPlayerKills && DeadModeFromIni(0, true) == DeadMode::kOff, "iDead present wins over bDead");
+		Check(DeadModeFromIni(9, false) == DeadMode::kAll, "iDead too large clamps to all");
+		Check(!ShowsDeadBody(DeadMode::kOff, true) && ShowsDeadBody(DeadMode::kAll, false), "dead: off hides, all shows");
+		Check(ShowsDeadBody(DeadMode::kPlayerKills, true) && !ShowsDeadBody(DeadMode::kPlayerKills, false), "dead: player kills only");
+
+		// Hold to zoom out.
+		Check(Near(HoldZoomRadius(3000, false, 3.0f), 3000) && Near(HoldZoomRadius(3000, true, 3.0f), 9000), "hold zoom: factor only while held");
+		Check(Near(HoldZoomRadius(1000, true, 10.0f), 6000) && Near(HoldZoomRadius(1000, true, 1.0f), 1500), "hold zoom: factor clamped 1.5..6");
+		Check(Near(HoldZoomRadius(1000, true, std::numeric_limits<float>::quiet_NaN()), 1500), "hold zoom: NaN factor is safe");
+
+		// Trail: spacing, ring buffer order, wrap-around, fading.
+		TrailBuffer trail;
+		Check(trail.Offer({ 0, 0 }, 256) && !trail.Offer({ 100, 100 }, 256) && trail.Offer({ 300, 0 }, 256), "trail: points closer than the spacing are skipped");
+		Check(trail.Size() == 2 && Near(trail.At(0).x, 0) && Near(trail.At(1).x, 300), "trail: oldest first");
+		for (int i = 2; i < TrailBuffer::kCapacity + 10; ++i)
+			trail.Offer({ 300.0f * static_cast<float>(i), 0 }, 256);
+		Check(trail.Size() == TrailBuffer::kCapacity, "trail: ring buffer holds its capacity");
+		Check(Near(trail.At(0).x, 300.0f * 10) && Near(trail.At(TrailBuffer::kCapacity - 1).x, 300.0f * (TrailBuffer::kCapacity + 9)), "trail: oldest dropped on wrap");
+		Check(TrailBuffer::AgeAlpha(0, 4) < TrailBuffer::AgeAlpha(3, 4) && Near(TrailBuffer::AgeAlpha(3, 4), 1.0f), "trail: older points fainter, newest full");
+		trail.Clear();
+		Check(trail.Size() == 0 && trail.Offer({ 5, 5 }, 256), "trail: clear starts fresh");
+
+		// Glyphs and text layout.
+		IconShape g;
+		Check(GlyphShape('0', g) && g == IconShape::kGlyphFirst, "glyph: '0' is the first glyph cell");
+		Check(GlyphShape('z', g) && g == static_cast<IconShape>(static_cast<int>(IconShape::kCount) - 1), "glyph: 'z' is the last cell");
+		Check(!GlyphShape(' ', g) && !GlyphShape('\xE9', g) && !GlyphShape('@', g), "glyph: space and unknown characters have none");
+		// Per-glyph advances: wide m / w, narrow i / l / '.', a space as wide as an 'n'.
+		auto advOf = [](char a_c) {
+			IconShape shape;
+			GlyphShape(a_c, shape);
+			return 10.0f * GlyphAdvanceEm(shape);
+		};
+		Check(advOf('m') > advOf('n') * 1.25f && advOf('w') > advOf('v') * 1.25f && advOf('i') < advOf('n') * 0.6f && advOf('.') < advOf('n') * 0.6f,
+			"text: m and w wider, i and . narrower than n");
+		Check(advOf('o') == advOf('n') && Near(10.0f * SpaceAdvanceEm(), advOf('n')), "text: space advances like an n");
+		Check(advOf('n') >= 10.0f * 0.55f, "text: n advance leaves a gap clear of the outline");
+		std::vector<GlyphPlacement> line;
+		const float w = LayoutText("45m", 10.0f, TextAlign::kCenter, line);
+		const float a4 = advOf('4'), a5 = advOf('5'), am = advOf('m');
+		Check(line.size() == 3 && Near(w, a4 + a5 + am) && Near(line[0].x, -w * 0.5f + a4 * 0.5f) && Near(line[1].x, -w * 0.5f + a4 + a5 * 0.5f) &&
+				  Near(line[2].x, w * 0.5f - am * 0.5f),
+			"text: centred line");
+		line.clear();
+		LayoutText("a b", 10.0f, TextAlign::kLeft, line);
+		Check(line.size() == 2 && Near(line[0].x, advOf('a') * 0.5f) && Near(line[1].x, advOf('a') + advOf('n') + advOf('b') * 0.5f), "text: space advances without a glyph");
+		line.clear();
+		const float wr = LayoutText("x@y", 10.0f, TextAlign::kRight, line);
+		Check(line.size() == 2 && Near(wr, advOf('x') + advOf('y')) && Near(line[1].x, -advOf('y') * 0.5f), "text: unknown characters skipped, right aligned");
+
+		// Compass letters: N at the top with a north-up map, on the right when facing west; square edge.
+		const float pi = std::numbers::pi_v<float>;
+		IconView    v;
+		v.sizePx = 200;
+		v.centerPx = { 500, 300 };
+		// Each letter: kOutlineCopies outline copies, then the letter itself.
+		constexpr std::size_t perLetter = kOutlineCopies + 1;
+		const auto            text = PackRgba(240, 240, 240), outline = PackRgba(0, 0, 0, 200);
+		std::vector<IconInstance> letters;
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kInside, letters);
+		IconShape n;
+		GlyphShape('N', n);
+		const auto& nIn = letters.size() == 4 * perLetter ? letters[perLetter - 1] : IconInstance{};
+		const auto& eIn = letters.size() == 4 * perLetter ? letters[2 * perLetter - 1] : IconInstance{};
+		Check(letters.size() == 4 * perLetter && nIn.uv.u0 == AtlasUv(n).u0 && nIn.uv.v0 == AtlasUv(n).v0 && nIn.rgba == text, "compass: four outlined letters, N first");
+		Check(Near(nIn.x, 500) && Near(nIn.y, 300 - (100 - 6 - 2)) && Near(nIn.size, 12) && nIn.clip == 1.0f, "compass inside: N just inside the top, larger, clipped");
+		Check(Near(eIn.x, 500 + (100 - 5 - 2)) && Near(eIn.y, 300) && (eIn.rgba >> 24) < 255, "compass inside: E on the right, dimmer");
+		Check(letters.size() == 4 * perLetter && letters[0].rgba == outline && letters[0].uv.u0 == nIn.uv.u0 && Near(letters[0].x, 499) && Near(letters[0].y, nIn.y - 1),
+			"compass: outline copies first, in the outline colour, 1 px off");
+		letters.clear();
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kOutside, letters);
+		const auto& nOut = letters.size() == 4 * perLetter ? letters[perLetter - 1] : IconInstance{};
+		Check(Near(nOut.y, 300 - (100 + 6 + 2)) && nOut.clip == 0.0f, "compass outside: N just beyond the ring, not clipped");
+		letters.clear();
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kOff, letters);
+		Check(letters.empty(), "compass off: nothing drawn");
+		v.mapAngle = -pi / 2;  // facing west: north is to the right
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kInside, letters);
+		Check(letters.size() == 4 * perLetter && Near(letters[perLetter - 1].x, 500 + 92, 1e-2f) && Near(letters[perLetter - 1].y, 300, 1e-2f), "compass: N turns with the map");
+		letters.clear();
+		v.mapAngle = pi / 4;  // square map: the letter sits on the square edge, not a circle
+		v.round = false;
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kInside, letters);
+		Check(letters.size() == 4 * perLetter && Near(std::fmax(std::fabs(letters[perLetter - 1].x - 500), std::fabs(letters[perLetter - 1].y - 300)), 92, 1e-2f),
+			"compass: square shape uses the square edge");
+		letters.clear();
+		v.mapAngle = 0;
+		AppendCompassLetters(v, 10.0f, text, outline, CompassMode::kOutside, letters);
+		Check(letters.size() == 4 * perLetter && Near(letters[2 * perLetter - 1].x, 500 + 100 + 5 + 2) && Near(letters[2 * perLetter - 1].y, 300),
+			"compass outside, square: E centred beyond the right side");
+		Check(CompassModeFromIni(-1, -1) == CompassMode::kOutside && CompassModeFromIni(-1, 0) == CompassMode::kOff && CompassModeFromIni(-1, 1) == CompassMode::kOutside,
+			"iCompassLetters missing: bCompassLetters false = off, true or missing = outside");
+		Check(CompassModeFromIni(1, 0) == CompassMode::kInside && CompassModeFromIni(7, 1) == CompassMode::kOutside, "iCompassLetters present wins, clamped");
+		Check(Near(CompassLetterDistance(100, 10, CompassMode::kInside), 93) && Near(CompassLetterDistance(100, 10, CompassMode::kOutside), 107), "compass letter distance");
+
+		// Outlines: dark text on a light outline works the same way.
+		std::vector<IconInstance> outlined;
+		IconInstance              glyph;
+		glyph.x = 10;
+		glyph.y = 20;
+		glyph.size = 28;
+		glyph.rgba = PackRgba(20, 20, 20);
+		AppendOutlinedGlyph(glyph, PackRgba(255, 255, 255, 200), outlined);
+		Check(outlined.size() == perLetter && outlined.back().rgba == glyph.rgba && outlined[0].rgba == PackRgba(255, 255, 255, 200) && Near(outlined[3].x, 12) &&
+				  Near(outlined[3].y, 22),
+			"outline: copies scale with big glyphs, glyph on top");
+		outlined.clear();
+		AppendOutlinedGlyph(glyph, PackRgba(0, 0, 0, 0), outlined);
+		Check(outlined.size() == 1, "outline: alpha 0 = no outline");
+
+		// Dead body log from the death events.
+		DeadBodyLog deaths;
+		Check(deaths.Add(0x10, false) && !deaths.Add(0x10, true) && deaths.Entries().size() == 1 && deaths.Entries()[0].killedByPlayer,
+			"dead log: second event for the same body merges the killer flag");
+		for (std::uint32_t id = 0x100; id < 0x100 + DeadBodyLog::kCapacity; ++id)
+			deaths.Add(id, false);
+		Check(deaths.Entries().size() == static_cast<std::size_t>(DeadBodyLog::kCapacity) && deaths.Entries()[0].formId == 0x100, "dead log: capped, oldest out");
+		deaths.RemoveIf([](const DeadBodyLog::Entry& a_e) { return a_e.formId < 0x110; });
+		Check(deaths.Entries().size() == static_cast<std::size_t>(DeadBodyLog::kCapacity) - 16, "dead log: unloaded bodies removed");
+		deaths.Clear();
+		Check(deaths.Entries().empty(), "dead log: cleared on load");
+
+		// Labels: offset under the icon, clamp like the icon, flip above near the bottom rim.
+		IconView lv;
+		lv.player = { 0, 0 };
+		lv.unitsPerPixel = 10;
+		lv.sizePx = 200;
+		lv.centerPx = { 500, 300 };
+		IconSource label;
+		label.world = { 0, 200 };  // 20 px north
+		label.shape = IconShape::kGlyphFirst;
+		label.sizePx = 10;
+		label.offsetPx = { 4, 12 };
+		label.flipOffsetInside = true;
+		std::vector<IconInstance> out;
+		BuildIconInstances(std::span(&label, 1), lv, out);
+		Check(out.size() == 1 && Near(out[0].x, 504) && Near(out[0].y, 300 - 20 + 12), "label: offset below its point");
+		label.world = { 0, -900 };  // 90 px south: below would leave the map
+		out.clear();
+		BuildIconInstances(std::span(&label, 1), lv, out);
+		Check(out.size() == 1 && Near(out[0].y, 300 + 90 - 12), "label: flips above near the bottom rim");
+		label.world = { 90000, 0 };  // far east, clamps like a 20 px star
+		label.clampToRim = true;
+		label.anchorSizePx = 20;
+		label.offsetPx = { 0, 12 };
+		out.clear();
+		BuildIconInstances(std::span(&label, 1), lv, out);
+		Check(out.size() == 1 && Near(out[0].x, 500 + 100 - 11) && Near(out[0].y, 312), "label: clamps with its icon's margin");
+		std::vector<IconSource> labelSrc;
+		AppendTextLabel(labelSrc, "1.2km", { 90000, 0 }, 17, 10, true, 0xFFFFFFFF, 0);
+		std::vector<GlyphPlacement> labelLine;
+		const float                 labelWidth = LayoutText("1.2km", 10, TextAlign::kCenter, labelLine);
+		Check(labelSrc.size() == 5 && labelSrc[0].anchorSizePx > labelWidth + 2 && Near(labelSrc[0].offsetPx.x, labelLine[0].x) &&
+				  Near(labelSrc[0].offsetPx.x + labelSrc[4].offsetPx.x, labelLine[0].x + labelLine[4].x) && labelSrc[0].offsetPx.x < 0 && labelSrc[4].offsetPx.x > 0 &&
+				  labelSrc[0].flipOffsetInside,
+			"label: wide label clamps farther in, centred under its icon");
+		out.clear();
+		BuildIconInstances(labelSrc, lv, out);
+		bool inside = out.size() == 5;
+		for (const auto& inst : out)
+			inside = inside && InsideMask({ inst.x - 500, inst.y - 300 }, 100, true, inst.size * 0.5f - 0.01f);
+		Check(inside, "label: every glyph of a rim label stays inside the map");
+		labelSrc.clear();
+		AppendTextLabel(labelSrc, "45m", { 0, 0 }, 17, 10, false, PackRgba(255, 200, 48), PackRgba(0, 0, 0, 190));
+		out.clear();
+		BuildIconInstances(labelSrc, lv, out);
+		Check(labelSrc.size() == 3 && labelSrc[0].outlineRgba == PackRgba(0, 0, 0, 190) && out.size() == 3 * perLetter && out[perLetter - 1].rgba == PackRgba(255, 200, 48),
+			"label: quest distance glyphs drawn with their outline");
+	}
+
+	void TestBatch2Helpers()
+	{
+		// Vendor classification from the buy/sell list.
+		Check(ClassifyVendor(true, 0) == ServiceKind::kGeneralGoods && ClassifyVendor(true, kGoodsWeaponsArmor) == ServiceKind::kGeneralGoods,
+			"vendor: sells all but its list = general goods");
+		Check(ClassifyVendor(false, kGoodsWeaponsArmor) == ServiceKind::kBlacksmith, "vendor: weapons/armour = blacksmith");
+		Check(ClassifyVendor(false, kGoodsPotions) == ServiceKind::kAlchemist, "vendor: potions = alchemist");
+		Check(ClassifyVendor(false, kGoodsFood) == ServiceKind::kInnkeeper, "vendor: food = innkeeper");
+		Check(ClassifyVendor(false, kGoodsSpells | kGoodsPotions) == ServiceKind::kSpells, "vendor: spell tomes win over potions (court wizard)");
+		Check(ClassifyVendor(false, kGoodsWeaponsArmor | kGoodsFood) == ServiceKind::kBlacksmith, "vendor: blacksmith wins over food");
+		Check(ClassifyVendor(false, 0) == ServiceKind::kNone, "vendor: empty list = no service");
+		Check(ShapeForService(ServiceKind::kBlacksmith) == IconShape::kAnvil && ShapeForService(ServiceKind::kInnkeeper) == IconShape::kMug &&
+				  ShapeForService(ServiceKind::kAlchemist) == IconShape::kFlask && ShapeForService(ServiceKind::kGeneralGoods) == IconShape::kBag &&
+				  ShapeForService(ServiceKind::kSpells) == IconShape::kBook,
+			"service -> shape");
+
+		// Clock.
+		Check(FormatClock(13.09f, true) == "13:05" && FormatClock(7.5f, true) == "07:30" && FormatClock(0.0f, true) == "00:00", "clock: 24 h");
+		Check(FormatClock(13.09f, false) == "1:05 PM" && FormatClock(0.25f, false) == "12:15 AM" && FormatClock(12.0f, false) == "12:00 PM", "clock: 12 h");
+		Check(FormatClock(23.999f, true) == "23:59" && FormatClock(24.0f, true) == "00:00" && FormatClock(-1.0f, true) == "23:00", "clock: wraps around midnight");
+		Check(FormatClock(std::numeric_limits<float>::quiet_NaN(), true) == "00:00", "clock: NaN is safe");
+		Check(AllCharsHaveGlyphs("Dragon's Bridge") && AllCharsHaveGlyphs("Fort Dawnguard - East"), "location names: Latin letters, spaces, apostrophe, dash");
+		Check(!AllCharsHaveGlyphs("Vinterh\xE4lla") && !AllCharsHaveGlyphs("Ruins (old)"), "location names: other characters -> clock only");
+
+		// Fog of war bits.
+		Fog::WorldMap map;
+		Check(!map.Get(0, 0) && map.Set(0, 0) && map.Get(0, 0) && !map.Set(0, 0), "fog: set once, then already set");
+		Check(map.Set(-1, -33) && map.Get(-1, -33) && !map.Get(-1, -32) && !map.Get(0, -33), "fog: negative blocks across chunk edges");
+		Check(Fog::BlockOf(-0.5f) == -1 && Fog::BlockOf(1023.9f) == 0 && Fog::BlockOf(1024.0f) == 1, "fog: quarter-cell blocks");
+		Fog::WorldMap reveal;
+		const int flipped = reveal.RevealAround({ 512, 512 }, Fog::kRevealRadius);
+		Check(flipped > 40 && flipped < 60 && reveal.Get(0, 0) && reveal.Get(4, 0) && !reveal.Get(5, 0) && !reveal.Get(4, 4), "fog: about one cell around the player");
+		Check(reveal.RevealAround({ 512, 512 }, Fog::kRevealRadius) == 0, "fog: standing still flips nothing");
+
+		// Mask window: snapped, row 0 = north.
+		int ox = 0, oy = 0;
+		Fog::MaskOrigin({ 512, 512 }, ox, oy);
+		Check(ox == -Fog::kMaskSize / 2 && oy == -Fog::kMaskSize / 2, "fog mask: window centred on the snapped block");
+		int ox2 = 0, oy2 = 0;
+		Fog::MaskOrigin({ 512 + 31 * Fog::kBlockUnits, 512 }, ox2, oy2);
+		Check(ox2 == ox, "fog mask: window does not move within a snap step");
+		Fog::MaskOrigin({ 512 + 32 * Fog::kBlockUnits, 512 }, ox2, oy2);
+		Check(ox2 == ox + Fog::kMaskSnap, "fog mask: window moves by one snap step");
+		std::vector<std::uint8_t> mask;
+		Fog::WorldMap one;
+		one.Set(ox + 3, oy + Fog::kMaskSize - 1);  // north-west corner area
+		one.BuildMask(ox, oy, Fog::kMaskSize, mask);
+		Check(mask.size() == static_cast<std::size_t>(Fog::kMaskSize * Fog::kMaskSize) && mask[3] == 255 && std::count(mask.begin(), mask.end(), 255) == 1,
+			"fog mask: north row first, one pixel per block");
+		const Rect mr = Fog::MaskRect(ox, oy);
+		Check(Near(mr.minX, ox * Fog::kBlockUnits) && Near(mr.maxY - mr.minY, Fog::kMaskSize * Fog::kBlockUnits), "fog mask: world rect");
+
+		// Co-save round trip, load order changes and broken data.
+		Fog::Store store;
+		store.World(0x3C).Set(10, -20);
+		store.World(0x0200ABCD).Set(-5, 7);
+		const auto bytes = store.Serialize();
+		Fog::Store loaded;
+		auto       remap = [](std::uint32_t a_old, std::uint32_t& a_new) {
+            if (a_old == 0x0200ABCD) {
+                a_new = 0x0300ABCD;  // its plugin moved one slot
+                return true;
+            }
+            a_new = a_old;
+            return a_old == 0x3C;
+		};
+		Check(loaded.Deserialize(bytes, remap) && loaded.WorldCount() == 2 && loaded.Find(0x3C) && loaded.Find(0x3C)->Get(10, -20) && loaded.Find(0x0300ABCD) &&
+				  loaded.Find(0x0300ABCD)->Get(-5, 7) && !loaded.Find(0x0200ABCD),
+			"fog save: round trip with a moved plugin");
+		auto dropSecond = [](std::uint32_t a_old, std::uint32_t& a_new) {
+			a_new = a_old;
+			return a_old == 0x3C;
+		};
+		Fog::Store dropped;
+		Check(dropped.Deserialize(bytes, dropSecond) && dropped.WorldCount() == 1 && dropped.Find(0x3C), "fog save: a removed worldspace is dropped");
+		Fog::Store broken;
+		broken.World(1).Set(0, 0);
+		const std::vector<std::uint8_t> cut(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(bytes.size() / 2));
+		Check(!broken.Deserialize(cut, remap) && broken.Find(1), "fog save: cut data is refused and keeps the old state");
+		Check(loaded.Deserialize({}, remap) == false, "fog save: empty record refused");
 	}
 
 	struct Pixel
@@ -646,7 +943,11 @@ namespace
 			{ at(0, 140), IconShape::kCircle, red, 7, 0, false },       // off the map: must not draw
 			{ at(0, 122), IconShape::kCircle, other, 24, 0, false },     // on the edge: partly clipped by the mask
 			{ at(5000, 0), IconShape::kStar, gold, 17, 0, true },       // quest far east: on the rim
+			{ at(-60, 60), IconShape::kHorse, PackRgba(200, 160, 110), 14, 0, true },
 		};
+		// Distance label for the rim star, built the way IconData builds it.
+		const std::size_t worldBeforeLabel = world.size();
+		AppendTextLabel(world, FormatDistance(5000 * upp), at(5000, 0), 17, 13, true, gold, PackRgba(0, 0, 0, 190));
 		std::vector<IconSource> radar{
 			{ at(-50, 40), IconShape::kDoor, door, 11, 0, false },
 			{ at(70, -20), IconShape::kDoor, door, 11, 0, false },
@@ -681,6 +982,7 @@ namespace
             iv.centerPx = { a_left + size * 0.5f, 22 + size * 0.5f };
             iv.iconScale = 1.0f;
             std::vector<IconInstance> inst;
+            AppendCompassLetters(iv, 13.0f, PackRgba(240, 240, 240), PackRgba(0, 0, 0, 190), CompassMode::kInside, inst);
             BuildIconInstances(a_src, iv, inst);
             inst.push_back(ArrowInstance(iv, 11.0f * 2.5f, op.arrowAngle, PackRgba(255, 247, 230)));
             renderer.DrawIcons(a_ctx, { op.viewportW, op.viewportH, iv.centerPx, size, a_round, op.opacity }, inst);
@@ -694,7 +996,9 @@ namespace
 		panel(622, true, 0.0f, false, radar);                           // interior radar
 		saved->Restore(a_ctx);
 		delete saved;
-		Check(n1 == world.size() - 1 + 1, "panel 1: every icon but the off-map one, plus the arrow");
+		const std::size_t labelGlyphs = world.size() - worldBeforeLabel;
+		Check(n1 == 4 * (kOutlineCopies + 1) + (world.size() - 1 - labelGlyphs) + labelGlyphs * (kOutlineCopies + 1) + 1 && labelGlyphs >= 3,
+			"panel 1: outlined compass letters, every icon but the off-map one, the outlined label, the arrow");
 
 		ComPtr<ID3D11RenderTargetView> after;
 		a_ctx->OMGetRenderTargets(1, &after, nullptr);
@@ -822,6 +1126,138 @@ namespace
 		const auto     none = kNavNoNeighbour;
 		a_tris.push_back({ { b, static_cast<std::uint16_t>(b + 1), static_cast<std::uint16_t>(b + 2) }, { none, none, static_cast<std::uint16_t>(t + 1) }, 0 });
 		a_tris.push_back({ { b, static_cast<std::uint16_t>(b + 2), static_cast<std::uint16_t>(b + 3) }, { t, none, none }, 0 });
+	}
+
+	// Every glyph and some real place names at the sizes the plugin uses, dark-on-light and light-on-dark, for checking
+	// readability by eye (text_preview.png).
+	void TestTextPreview(ID3D11Device* a_dev, ID3D11DeviceContext* a_ctx, const fs::path& a_out)
+	{
+		MapRenderer renderer;
+		std::string error;
+		Check(renderer.Init(a_dev, error), ("renderer init (text) " + error).c_str());
+		if (!renderer.Ready())
+			return;
+		constexpr UINT kW = 1000, kPanelH = 330;
+		D3D11_TEXTURE2D_DESC td{};
+		td.Width = kW;
+		td.Height = kPanelH;
+		td.MipLevels = td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_RENDER_TARGET;
+		D3D11_TEXTURE2D_DESC sheetDesc = td;
+		sheetDesc.Height = kPanelH * 2;
+		sheetDesc.BindFlags = 0;
+		ComPtr<ID3D11Texture2D> sheet;
+		if (FAILED(a_dev->CreateTexture2D(&sheetDesc, nullptr, &sheet))) {
+			Check(false, "text preview sheet");
+			return;
+		}
+		struct Panel
+		{
+			float         bg[4];
+			std::uint32_t text, outline;
+		};
+		const Panel panels[]{
+			{ { 0.78f, 0.80f, 0.82f, 1 }, PackRgba(20, 20, 20), PackRgba(255, 255, 255, 200) },  // default: dark text, light outline (snow)
+			{ { 0.16f, 0.17f, 0.15f, 1 }, PackRgba(240, 240, 240), PackRgba(0, 0, 0, 190) },     // light text, dark outline
+		};
+		const char* lines[]{ "0123456789.?:'-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "Riverwood  Pinepeak Cavern  Whiterun",
+			"Bleak Falls Barrow  Mzinchaleft  High Hrothgar", "12:04  1.2km  45m  N E S W" };
+		constexpr float kSizes[]{ 17.0f, 18.0f };  // quest labels / compass, the clock line
+		D3DStateBlock* saved = new D3DStateBlock;
+		saved->Backup(a_ctx);
+		for (UINT p = 0; p < 2; ++p) {
+			ComPtr<ID3D11Texture2D>        tex;
+			ComPtr<ID3D11RenderTargetView> rtv;
+			if (FAILED(a_dev->CreateTexture2D(&td, nullptr, &tex)) || FAILED(a_dev->CreateRenderTargetView(tex.Get(), nullptr, &rtv))) {
+				Check(false, "text preview target");
+				break;
+			}
+			a_ctx->ClearRenderTargetView(rtv.Get(), panels[p].bg);
+			a_ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+			const D3D11_VIEWPORT vp{ 0, 0, static_cast<float>(kW), static_cast<float>(kPanelH), 0, 1 };
+			a_ctx->RSSetViewports(1, &vp);
+			std::vector<IconInstance> inst;
+			float                     y = 20.0f;
+			for (const float size : kSizes) {
+				for (const char* text : lines) {
+					std::vector<GlyphPlacement> glyphs;
+					LayoutText(text, size, TextAlign::kLeft, glyphs);
+					for (const auto& g : glyphs) {
+						IconInstance i;
+						i.x = 16.0f + g.x;
+						i.y = y;
+						i.size = size;
+						i.clip = 0.0f;
+						i.uv = AtlasUv(g.shape);
+						i.rgba = panels[p].text;
+						AppendOutlinedGlyph(i, panels[p].outline, inst);
+					}
+					y += size * 0.75f;
+				}
+				y += 8.0f;
+			}
+			renderer.DrawIcons(a_ctx, { static_cast<float>(kW), static_cast<float>(kPanelH), { 0, 0 }, 10.0f, true, 1.0f }, inst);
+			a_ctx->CopySubresourceRegion(sheet.Get(), 0, 0, p * kPanelH, 0, tex.Get(), 0, nullptr);
+		}
+		saved->Restore(a_ctx);
+		delete saved;
+		Check(SaveColor(a_ctx, sheet.Get(), a_out / "text_preview.png"), "save text_preview.png");
+	}
+
+	// Fog of war in the compose: unexplored land darker, explored land and town photos unchanged.
+	void TestFogRender(ID3D11Device* a_dev, ID3D11DeviceContext* a_ctx, const fs::path& a_data, const fs::path& a_out)
+	{
+		MapRenderer renderer;
+		std::string error;
+		Check(renderer.Init(a_dev, error), ("renderer init (fog) " + error).c_str());
+		if (!renderer.Ready())
+			return;
+		TileCache cache(a_dev, [&](const std::string& a_path, std::vector<std::uint8_t>& a_bytes) { return ReadFile(a_data, a_path, a_bytes); }, 256u << 20);
+		cache.SetWorld("Tamriel");
+		cache.Want(WhiterunTiles(), 1024);
+		cache.WaitIdle();
+		cache.Collect();
+		std::vector<TileDraw> draws;
+		for (const auto& id : WhiterunTiles())
+			if (const Tile* t = cache.Find(id); t && !t->absent)
+				draws.push_back({ id, t->diffuse.Get(), t->normal.Get(), t->water.Get() });
+
+		ComposeParams cp;
+		cp.center = { 19000.0f, -7000.0f };
+		cp.unitsPerPixel = 64.0f;
+		cp.targetSize = 512;
+		renderer.Compose(a_ctx, cp, draws);
+		UINT       pitch = 0;
+		const auto plain = ReadBack(a_dev, a_ctx, renderer.ComposeTexture(), pitch);
+
+		Fog::WorldMap map;
+		map.RevealAround(cp.center, 6000.0f);
+		int ox = 0, oy = 0;
+		Fog::MaskOrigin(cp.center, ox, oy);
+		std::vector<std::uint8_t> mask;
+		map.BuildMask(ox, oy, Fog::kMaskSize, mask);
+		Check(renderer.SetFogMask(a_ctx, mask, Fog::kMaskSize) && renderer.SetFogMask(a_ctx, mask, Fog::kMaskSize), "fog mask created, then updated in place");
+		cp.fog = { true, Fog::MaskRect(ox, oy), 0.6f, false };
+		renderer.Compose(a_ctx, cp, draws);
+		Check(SaveColor(a_ctx, renderer.ComposeTexture(), a_out / "fog_preview.png"), "save fog_preview.png");
+		const auto fogged = ReadBack(a_dev, a_ctx, renderer.ComposeTexture(), pitch);
+		if (plain.empty() || fogged.size() != plain.size()) {
+			Check(false, "read back fog compose");
+			return;
+		}
+		auto lum = [&](const std::vector<std::uint8_t>& a_px, int a_x, int a_y) {
+			const auto* p = &a_px[static_cast<std::size_t>(a_y) * pitch + static_cast<std::size_t>(a_x) * 4];
+			return (p[0] + p[1] + p[2]) / 3.0f;
+		};
+		// Centre: explored. Corner (16 000 units out): unexplored, about 40 % brightness.
+		const float centrePlain = lum(plain, 256, 256), centreFog = lum(fogged, 256, 256);
+		const float cornerPlain = lum(plain, 20, 20), cornerFog = lum(fogged, 20, 20);
+		std::printf("fog: centre %.0f -> %.0f, corner %.0f -> %.0f\n", centrePlain, centreFog, cornerPlain, cornerFog);
+		Check(std::fabs(centrePlain - centreFog) <= 2.0f, "fog: explored land unchanged");
+		Check(cornerPlain > 10.0f && std::fabs(cornerFog - cornerPlain * 0.4f) <= 4.0f, "fog: unexplored land darkened by fFogDarkness");
 	}
 
 	void TestNavRender(ID3D11Device* a_dev, ID3D11DeviceContext* a_ctx, const fs::path& a_out)
@@ -989,7 +1425,7 @@ namespace
 		bool cropOk = true;
 		for (int dy = 0; dy < 2; ++dy) {
 			for (int dx = 0; dx < 2; ++dx) {
-				const auto  tile = BI::CropCell(img, 7.7f, 2, dx, dy);
+				const auto  tile = BI::CropCell(img, 7.7f, 2, dx, dy, BI::kDefaultTileSize);
 				const auto* mid = tile.data() + (static_cast<std::size_t>(256) * 512 + 256) * 3;
 				for (int c = 0; c < 3; ++c)
 					cropOk &= std::abs(mid[c] - static_cast<int>(colours[dy][dx][c])) <= 1;
@@ -1053,10 +1489,10 @@ namespace
 			bool cropOk = true;
 			for (int dy = 0; dy < grid; ++dy) {
 				for (int dx = 0; dx < grid; ++dx) {
-					const auto tile = BI::CropCell(img, 7.7f, grid, dx, dy);
-					cropOk &= tile.size() == static_cast<std::size_t>(BI::kTileSize) * BI::kTileSize * 3;
+					const auto tile = BI::CropCell(img, 7.7f, grid, dx, dy, BI::kDefaultTileSize);
+					cropOk &= tile.size() == static_cast<std::size_t>(BI::kDefaultTileSize) * BI::kDefaultTileSize * 3;
 					for (const auto& [tx, ty] : { std::pair{ 256, 256 }, std::pair{ 128, 128 }, std::pair{ 384, 384 } }) {
-						const auto* px = tile.data() + (static_cast<std::size_t>(ty) * BI::kTileSize + tx) * 3;
+						const auto* px = tile.data() + (static_cast<std::size_t>(ty) * BI::kDefaultTileSize + tx) * 3;
 						for (int c = 0; c < 3; ++c)
 							cropOk &= std::abs(px[c] - static_cast<int>(colour(dx, dy, c))) <= 1;
 					}
@@ -1159,6 +1595,460 @@ namespace
 		Check(junkRead.done.empty() && junkRead.droppedGrid == 0, "progress: broken lines are ignored");
 	}
 
+
+	// [Bake] iTileSize: clamping, a 1024 px crop, the lossless master .bmp, and photo pixels per cell.
+	void TestBakeTileSize()
+	{
+		namespace BI = BakeImage;
+		Check(BI::ClampTileSize(512) == 512 && BI::ClampTileSize(1024) == 1024 && BI::ClampTileSize(2048) == 2048, "tile size: 512, 1024 and 2048 kept");
+		Check(BI::ClampTileSize(0) == 512 && BI::ClampTileSize(-7) == 512 && BI::ClampTileSize(256) == 512, "tile size: below 512 -> 512");
+		Check(BI::ClampTileSize(700) == 512 && BI::ClampTileSize(1500) == 1024 && BI::ClampTileSize(2047) == 1024, "tile size: rounded down to a power of two");
+		Check(BI::ClampTileSize(4096) == 2048 && BI::ClampTileSize(1 << 30) == 2048, "tile size: above 2048 -> 2048");
+		Check(BI::ClampPhotoExposure(1.0f) == 1.0f && BI::ClampPhotoExposure(0.7f) == 0.7f && BI::ClampPhotoExposure(0.25f) == 0.25f, "photo exposure: 0.25..1 kept");
+		Check(BI::ClampPhotoExposure(0.1f) == 0.25f && BI::ClampPhotoExposure(-1.0f) == 0.25f && BI::ClampPhotoExposure(0.0f) == 0.25f, "photo exposure: below 0.25 -> 0.25");
+		Check(BI::ClampPhotoExposure(1.5f) == 1.0f && BI::ClampPhotoExposure(std::numeric_limits<float>::infinity()) == 1.0f, "photo exposure: above 1 -> 1");
+		Check(BI::ClampPhotoExposure(std::numeric_limits<float>::quiet_NaN()) == 1.0f, "photo exposure: unreadable -> 1");
+
+		const double px1 = BI::PhotoPixelsPerCell(1920, 7.7f, 1), px2 = BI::PhotoPixelsPerCell(1920, 7.7f, 2);
+		Check(px1 > 1000 && px1 < 1080 && Near(static_cast<float>(px1 / px2), 2.0f), "photo px per cell: about 1016 at 1080p with the 1x1 grid, twice the 2x2 grid");
+		Check(px1 < 1024 && px2 > 500 && px2 < 512, "photo px per cell: below both tile sizes at 1080p (the start warning fires)");
+
+		// The 2x2 photo of TestBakeImage, cropped to 1024 px tiles.
+		BI::RgbImage img;
+		img.w = 1920;
+		img.h = 1080;
+		img.px.assign(static_cast<std::size_t>(img.w) * img.h * 3, 0.0f);
+		const float colours[2][2][3]{ { { 200, 0, 0 }, { 0, 200, 0 } }, { { 0, 0, 200 }, { 200, 200, 0 } } };  // [dy][dx]
+		for (int y = 0; y < img.h; ++y)
+			for (int x = 0; x < img.w; ++x)
+				for (int c = 0; c < 3; ++c)
+					img.px[(static_cast<std::size_t>(y) * img.w + x) * 3 + c] = colours[y < img.h / 2 ? 1 : 0][x < img.w / 2 ? 0 : 1][c];
+		bool cropOk = true;
+		for (int dy = 0; dy < 2; ++dy) {
+			for (int dx = 0; dx < 2; ++dx) {
+				const auto tile = BI::CropCell(img, 7.7f, 2, dx, dy, 1024);
+				cropOk &= tile.size() == std::size_t{ 1024 } * 1024 * 3;
+				for (const auto& [tx, ty] : { std::pair{ 512, 512 }, std::pair{ 256, 768 }, std::pair{ 768, 256 } }) {
+					const auto* p = tile.data() + (static_cast<std::size_t>(ty) * 1024 + tx) * 3;
+					for (int c = 0; c < 3; ++c)
+						cropOk &= std::abs(p[c] - static_cast<int>(colours[dy][dx][c])) <= 1;
+				}
+			}
+		}
+		Check(cropOk, "1024 px crop: right size and the right cell");
+
+		// Master .bmp: 3x2 RGB image, rows padded to 4 bytes, bottom row first, BGR.
+		const std::vector<std::uint8_t> rgb{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 };  // top row: 3 px, bottom row: 3 px
+		const auto                      bmp = BI::EncodeBmp24(rgb, 3, 2);
+		const auto                      u32 = [&](std::size_t a_at) {
+            std::uint32_t v = 0;
+            std::memcpy(&v, bmp.data() + a_at, 4);
+            return v;
+		};
+		Check(bmp.size() == 54 + 12 * 2 && bmp[0] == 'B' && bmp[1] == 'M' && u32(2) == bmp.size() && u32(10) == 54 && u32(14) == 40 && u32(18) == 3 && u32(22) == 2 &&
+				  bmp[28] == 24 && u32(30) == 0,
+			"master bmp: 24-bit BITMAPINFOHEADER file, padded rows");
+		Check(bmp[54] == 12 && bmp[55] == 11 && bmp[56] == 10 && bmp[54 + 12] == 3 && bmp[54 + 12 + 2] == 1 && bmp[54 + 9] == 0, "master bmp: bottom row first, BGR, zero padding");
+		Check(BI::EncodeBmp24(rgb, 4, 2).empty() && BI::EncodeBmp24(rgb, 0, 2).empty(), "master bmp: too little data or no size -> nothing");
+		std::vector<std::uint8_t> big(std::size_t{ 1024 } * 1024 * 3, 77);
+		Check(BI::EncodeBmp24(big, 1024, 1024).size() == 54 + std::size_t{ 1024 } * 1024 * 3, "master bmp: 1024 px tile is 3 MB, no padding");
+	}
+
+	BtrMesh FlatSquare(float a_x0, float a_y0, float a_x1, float a_y1, float a_z)
+	{
+		BtrMesh m;
+		m.verts = { { a_x0, a_y0, a_z }, { a_x1, a_y0, a_z }, { a_x1, a_y1, a_z }, { a_x0, a_y1, a_z } };
+		m.tris = { { 0, 1, 2 }, { 0, 2, 3 } };
+		return m;
+	}
+
+	// Whole-map bake: which cells of a terrain LOD tile count as land.
+	void TestFullMapCells()
+	{
+		namespace BP = BakePlan;
+		const TileId tile{ 4, 8, -4 };
+		const float  edge = 4 * kCellUnits;
+		BtrData      btr;
+		btr.land.push_back(FlatSquare(0, 0, edge, edge, 100.0f));
+		Check(BP::LandCells(btr, tile).size() == 16, "land cells: dry tile -> all 16 cells");
+
+		// Sea over the western half (above the land), and a lake under the land in the east (land wins).
+		btr.water.push_back(FlatSquare(0, 0, 2 * kCellUnits, edge, 200.0f));
+		btr.water.push_back(FlatSquare(2 * kCellUnits, 0, edge, edge, 50.0f));
+		const auto cells = BP::LandCells(btr, tile);
+		std::set<std::pair<int, int>> want;
+		for (int cy = -4; cy < 0; ++cy)
+			for (int cx = 10; cx < 12; ++cx)
+				want.insert({ cx, cy });
+		Check(cells == want, "land cells: open water is left out, land above water stays, cell coordinates from the tile corner");
+
+		// An island one cell big in the sea: only that cell (and no neighbour) counts.
+		BtrData sea;
+		sea.land.push_back(FlatSquare(0, 0, edge, edge, -500.0f));
+		sea.land.push_back(FlatSquare(kCellUnits + 1024, 2 * kCellUnits + 1024, kCellUnits + 3072, 2 * kCellUnits + 3072, 300.0f));
+		sea.water.push_back(FlatSquare(0, 0, edge, edge, 0.0f));
+		Check(BP::LandCells(sea, tile) == std::set<std::pair<int, int>>{ { 9, -2 } }, "land cells: a small island marks only its own cell");
+
+		BtrData nothing;
+		Check(BP::LandCells(nothing, tile).empty() && BP::LandCells(btr, TileId{ 0, 0, 0 }).empty(), "land cells: no land mesh or a bad tile -> none");
+
+		// The full map goes through Blocks: serpentine rows, every land cell once.
+		std::set<std::pair<int, int>> map;
+		for (int cy = -3; cy <= 3; ++cy)
+			for (int cx = -5 + (cy & 1); cx <= 6; ++cx)
+				map.insert({ cx, cy });
+		const auto blocks = BP::Blocks(map, 1);
+		bool       shortMoves = blocks.size() == map.size();
+		for (std::size_t i = 1; i < blocks.size(); ++i)
+			shortMoves &= std::abs(blocks[i].first - blocks[i - 1].first) + std::abs(blocks[i].second - blocks[i - 1].second) <= 2;
+		Check(shortMoves, "full map, 1x1 grid: every cell once and only short moves along the serpentine rows");
+	}
+
+	// Photo bake quality guards: flat photo verdict with the LOD reference, highlight cap of the tone curve,
+	// clipped white metric, the photo px per cell warning and the map border clip.
+	void TestBakeQualityGuards()
+	{
+		namespace BI = BakeImage;
+		namespace BP = BakePlan;
+		using V = BI::ContrastVerdict;
+
+		// Flat verdict. Live values: sea / map edge 0.0-2.6, a plain snowfield 13.8 over a plain reference, ground 30+.
+		Check(BI::JudgeContrast(0.0f, -1.0f) == V::kEmpty && BI::JudgeContrast(2.6f, 1.0f) == V::kEmpty && BI::JudgeContrast(4.9f, 0.5f) == V::kEmpty,
+			"flat verdict: near-zero contrast is empty whatever the reference says");
+		Check(BI::JudgeContrast(13.8f, 3.3f) == V::kKeep && BI::JudgeContrast(5.0f, 2.5f) == V::kKeep, "flat verdict: plain snow over a plain reference is kept");
+		Check(BI::JudgeContrast(13.8f, 10.0f) == V::kFlat && BI::JudgeContrast(8.0f, 6.0f) == V::kFlat, "flat verdict: low contrast over a detailed reference is fog");
+		Check(BI::JudgeContrast(13.8f, -1.0f) == V::kFlat, "flat verdict: no reference keeps the old rule (below 15 = flat)");
+		Check(BI::JudgeContrast(30.0f, -1.0f) == V::kKeep && BI::JudgeContrast(15.0f, 40.0f) == V::kKeep && BI::JudgeContrast(-1.0f, -1.0f) == V::kKeep,
+			"flat verdict: normal photos and unmeasured photos are kept");
+		Check(BI::NeedsReferenceContrast(13.8f) && BI::NeedsReferenceContrast(5.0f) && !BI::NeedsReferenceContrast(4.9f) && !BI::NeedsReferenceContrast(15.0f) &&
+				  !BI::NeedsReferenceContrast(-1.0f),
+			"flat verdict: the reference is rendered only for the 5..15 band");
+		Check(BI::kClearlyEmptyContrast < BI::kEmptyContrast, "flat verdict: clearly empty is a subset of empty");
+
+		// Reference contrast from an RGBA render.
+		const int                 refSize = BI::ReferenceSize(1);
+		std::vector<std::uint8_t> plain(static_cast<std::size_t>(refSize) * refSize * 4, 200);
+		std::vector<std::uint8_t> checker = plain;
+		for (int y = 0; y < refSize; ++y)
+			for (int x = 0; x < refSize; ++x)
+				for (int c = 0; c < 3; ++c)
+					checker[(static_cast<std::size_t>(y) * refSize + x) * 4 + c] = ((x + y) & 1) ? 220 : 180;
+		Check(Near(BI::ReferenceContrast(plain, refSize), 0.0f) && Near(BI::ReferenceContrast(checker, refSize), 20.0f, 0.5f),
+			"reference contrast: plain render 0, +-20 checker about 20");
+		Check(BI::ReferenceContrast(std::span<const std::uint8_t>(plain).first(10), refSize) < 0.0f && BI::ReferenceContrast(plain, 0) < 0.0f,
+			"reference contrast: short data or no size -> -1");
+
+		// Clipped white share.
+		BI::RgbImage half;
+		half.w = 4;
+		half.h = 2;
+		half.px.assign(4 * 2 * 3, 255.0f);
+		for (int i = 0; i < 4 * 3; ++i)
+			half.px[static_cast<std::size_t>(i)] = 120.0f;  // top row grey
+		half.px[12] = 200.0f;                                  // one bottom pixel bright but below the limit (luma about 239)
+		Check(Near(BI::ClippedWhiteFraction(half), 3.0f / 8.0f), "clipped white: share of pixels with luma 250 or more");
+		Check(BI::ClippedWhiteFraction(BI::RgbImage{}) == 0.0f, "clipped white: empty image -> 0");
+
+		// Highlight cap: identity and darkening curves untouched; a lifting curve no longer clips bright input.
+		std::array<float, 256> identity{}, darker{}, lifted{};
+		for (int v = 0; v < 256; ++v) {
+			identity[v] = static_cast<float>(v);
+			darker[v] = static_cast<float>(v) * 0.8f;
+			lifted[v] = std::min(255.0f, static_cast<float>(v) * 1.3f);
+		}
+		auto capped = identity;
+		BI::CapHighlights(capped);
+		Check(capped == identity, "highlight cap: identity curve unchanged");
+		capped = darker;
+		BI::CapHighlights(capped);
+		Check(capped == darker, "highlight cap: a darkening curve is unchanged");
+		capped = lifted;
+		BI::CapHighlights(capped);
+		bool monotonic = true, belowWhite = true, notRaised = true;
+		for (int v = 1; v < 256; ++v)
+			monotonic &= capped[v] >= capped[v - 1];
+		for (int v = 0; v < 256; ++v)
+			notRaised &= capped[v] <= lifted[v];
+		for (int v = BI::kHighlightKnee; v <= 240; ++v)
+			belowWhite &= capped[v] < BI::kClippedLuma;
+		Check(monotonic && notRaised && belowWhite && Near(capped[255], 255.0f) && capped[100] == lifted[100],
+			"highlight cap: lifting curve stays monotonic, only lowered, bright input 192..240 stays below clipped white, shadows untouched");
+		std::printf("bake: lifted curve 230 -> %.1f before, %.1f after the highlight cap\n", lifted[230], capped[230]);
+
+		// FitMatch applies the cap: bright photo cells matched to an even brighter reference.
+		std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> pairs;
+		std::vector<std::uint8_t>                                                    photo(64 * 64 * 3), ref(64 * 64 * 3);
+		for (std::size_t i = 0; i < photo.size(); ++i) {
+			photo[i] = static_cast<std::uint8_t>(150 + (i / 3) % 90);                             // 150..239
+			ref[i] = static_cast<std::uint8_t>(std::min<std::size_t>(255, 190 + (i / 3) % 90));  // 190..255
+		}
+		pairs.emplace_back(photo, ref);
+		const auto tone = BI::FitMatch(pairs);
+		Check(tone.fitted && tone.lut[230] < BI::kClippedLuma && tone.lut[200] > 200.0f, "colour fit: lifts a bright photo but keeps 230 below clipped white");
+
+		// Photo px per cell warning (1016 px per cell at 1080p with the 1x1 grid).
+		Check(BI::TooFewPixelsPerCell(1920, 7.7f, 1, 1024) && !BI::TooFewPixelsPerCell(1920, 7.7f, 1, 512) && BI::TooFewPixelsPerCell(1920, 7.7f, 2, 512),
+			"detail warning: 1080p 1x1 below 1024 px tiles, enough for 512; 2x2 below 512");
+		Check(!BI::TooFewPixelsPerCell(0, 7.7f, 1, 1024) && !BI::TooFewPixelsPerCell(3840, 7.7f, 1, 1024), "detail warning: no screen size yet, or a 4K screen -> no warning");
+
+		// Map border clip.
+		const float       c = kCellUnits;
+		const BP::Polygon square{ { 0.5f * c, 0.5f * c }, { 2.5f * c, 0.5f * c }, { 2.5f * c, 2.5f * c }, { 0.5f * c, 2.5f * c } };
+		bool              squareOk = true;
+		for (int cy = -1; cy <= 3; ++cy)
+			for (int cx = -1; cx <= 3; ++cx)
+				squareOk &= BP::CellTouchesPolygon(square, cx, cy) == (cx >= 0 && cx <= 2 && cy >= 0 && cy <= 2);
+		Check(squareOk, "border: cells overlapping a square border, partly covered edge cells included");
+		const BP::Polygon spike{ { 0.0f, 0.4f * c }, { 10.0f * c, 0.5f * c }, { 0.0f, 0.6f * c } };  // thin, no cell corner inside
+		Check(BP::CellTouchesPolygon(spike, 5, 0) && !BP::CellTouchesPolygon(spike, 5, 1) && !BP::CellTouchesPolygon(spike, 11, 0),
+			"border: a cell an edge passes through counts with no corner or point inside it");
+		Check(!BP::CellTouchesPolygon(BP::Polygon{ { 0.0f, 0.0f }, { c, c } }, 0, 0), "border: fewer than 3 points -> no polygon");
+		const std::set<std::pair<int, int>> cells{ { 0, 0 }, { 1, 1 }, { 3, 3 }, { -50, -21 }, { 53, 9 } };
+		Check(BP::ClipToBorders(cells, { square }) == std::set<std::pair<int, int>>{ { 0, 0 }, { 1, 1 } }, "border: cells past the border are dropped");
+		Check(BP::ClipToBorders(cells, {}) == cells && BP::ClipToBorders(cells, { BP::Polygon{ { 0.0f, 0.0f } } }) == cells, "border: no usable border -> cells unchanged");
+		const BP::Polygon farSquare{ { 50.0f * c, 0.0f }, { 60.0f * c, 0.0f }, { 60.0f * c, 20.0f * c }, { 50.0f * c, 20.0f * c } };
+		Check(BP::ClipToBorders(cells, { square, farSquare }) == std::set<std::pair<int, int>>{ { 0, 0 }, { 1, 1 }, { 53, 9 } }, "border: several borders -> union");
+	}
+
+	// The progress file must hold a whole-map bake (~10000 shots) and read old files as before.
+	void TestBakeProgressFullMap()
+	{
+		namespace BP = BakePlan;
+		BP::Progress saved;
+		saved.grid = 1;
+		for (int cy = -50; cy < 50; ++cy)
+			for (int cx = -60; cx < 60; cx += 1)
+				if ((cx + cy) % 7 != 0)
+					saved.done.insert(BP::ShotKey("Tamriel", cx, cy));
+		saved.done.insert(BP::ShotKey("WhiterunWorld", 3, -2));
+		std::ostringstream text;
+		BP::WriteProgress(text, saved);
+		std::istringstream in(text.str());
+		const auto         back = BP::ParseProgress(in, 1);
+		Check(saved.done.size() > 10000 && back.done == saved.done && back.droppedGrid == 0, "progress: 10000+ shots with negative cells round trip");
+		Check(text.str().size() < 400000, "progress: a whole-map file stays small (rewritten after every photo)");
+		std::istringstream oldFile("# Modern Minimap town photo bake progress.\ngrid 1\ntone grade\ndone Tamriel -12 7\n");
+		const auto         old = BP::ParseProgress(oldFile, 1);
+		Check(old.done.contains(BP::ShotKey("Tamriel", -12, 7)) && old.toneKnown && !old.tone.fitted, "progress: a file from before the whole-map option reads the same");
+	}
+
+	// Pre-bake improvements: adaptive settle, tone.txt, spread colour fit, planned restarts, retry pass, append-only progress.
+	void TestBakePrebake()
+	{
+		namespace BP = BakePlan;
+		namespace BI = BakeImage;
+
+		// Adaptive settle decision.
+		const BP::SettleRule rule{ true, 1.5f, 15.0f, 0.75f };
+		const std::vector<float> calm{ 3.0f, 0.4f, 0.3f }, busy{ 0.3f, 0.4f, 2.0f }, oneCalm{ 0.3f }, noisy{ 0.6f, 0.7f };
+		Check(!BP::SettleDone(1.0f, calm, rule), "settle: never before the minimum, even when calm");
+		Check(BP::SettleDone(1.5f, calm, rule) && BP::SettleDone(2.0f, noisy, rule), "settle: two calm changes in a row after the minimum (small motion tolerated)");
+		Check(!BP::SettleDone(5.0f, busy, rule) && !BP::SettleDone(5.0f, oneCalm, rule) && !BP::SettleDone(5.0f, {}, rule), "settle: a big last change, one look or no looks keep waiting");
+		Check(BP::SettleDone(15.0f, busy, rule) && BP::SettleDone(15.0f, {}, rule), "settle: the longest wait always ends it");
+		const std::vector<float> failedLook{ -1.0f, -1.0f };
+		Check(!BP::SettleDone(5.0f, failedLook, rule), "settle: looks that could not be compared do not count as calm");
+		const BP::SettleRule fixedWait{ false, 1.5f, 7.0f, 0.75f };
+		Check(!BP::SettleDone(6.9f, calm, fixedWait) && BP::SettleDone(7.0f, calm, fixedWait), "settle: adaptive off waits the full time");
+
+		// Thumbnails: identical pictures do not differ; a moved bright square does; formats agree.
+		const int                 w = 160, h = 90;
+		std::vector<std::uint8_t> rgba(static_cast<std::size_t>(w) * h * 4, 100), moved = rgba;
+		for (int y = 30; y < 60; ++y)
+			for (int x = 40; x < 70; ++x)
+				for (int c = 0; c < 3; ++c)
+					moved[(static_cast<std::size_t>(y) * w + x) * 4 + c] = 250;
+		const auto still = BI::LumaThumbnail(rgba.data(), w, h, w * 4, DXGI_FORMAT_R8G8B8A8_UNORM, 16);
+		const auto shifted = BI::LumaThumbnail(moved.data(), w, h, w * 4, DXGI_FORMAT_R8G8B8A8_UNORM, 16);
+		const auto bgra = BI::LumaThumbnail(rgba.data(), w, h, w * 4, DXGI_FORMAT_B8G8R8A8_UNORM, 16);
+		Check(still.size() == 256 && Near(still[0], 100.0f, 0.01f) && BI::MeanAbsDiff(still, bgra) < 0.01f, "look thumbnail: grey picture, any byte order");
+		Check(BI::MeanAbsDiff(still, still) == 0.0f && BI::MeanAbsDiff(still, shifted) > 5.0f, "look thumbnail: no change -> 0, a new bright patch -> a clear change");
+		Check(BI::LumaThumbnail(nullptr, w, h, w * 4, DXGI_FORMAT_R8G8B8A8_UNORM, 16).empty() && BI::LumaThumbnail(rgba.data(), w, h, w * 4, DXGI_FORMAT_BC1_UNORM, 16).empty() &&
+				  BI::MeanAbsDiff(still, std::vector<float>(3, 0.0f)) < 0.0f,
+			"look thumbnail: bad input -> empty, different sizes -> -1");
+
+		// tone.txt round trip.
+		BI::Tone tone;
+		tone.fitted = true;
+		for (int v = 0; v < 256; ++v)
+			tone.lut[v] = static_cast<float>(v) * 0.987654321f + 1.0f / 3.0f;
+		tone.gain = { 1.0123457f, 0.98765432f, 1.1f };
+		std::ostringstream toneText;
+		BP::WriteToneText(toneText, tone);
+		Check(toneText.str().starts_with("fitted 1\ngain ") && toneText.str().find("\nlut ") != std::string::npos, "tone.txt: fitted, gain and lut lines");
+		std::istringstream toneIn(toneText.str());
+		const auto         toneBack = BP::ParseToneText(toneIn);
+		Check(toneBack.fitted && toneBack.gain == tone.gain && toneBack.lut == tone.lut, "tone.txt: round trip keeps every float exactly");
+		std::ostringstream fallbackText;
+		BP::WriteToneText(fallbackText, BI::Tone{});
+		std::istringstream fallbackIn(fallbackText.str()), emptyIn, brokenIn("fitted 1\nlut 1 2 3\ngain x\n");
+		const auto         fallback = BP::ParseToneText(fallbackIn), none = BP::ParseToneText(emptyIn), broken = BP::ParseToneText(brokenIn);
+		Check(!fallback.fitted && fallback.gain[0] == 1.0f && !none.fitted && none.gain[1] == 1.0f, "tone.txt: the fallback tone and a missing file read as Tone{}");
+		Check(broken.fitted && broken.lut[2] == 0.0f && broken.gain[2] == 1.0f, "tone.txt: a short lut or a broken gain line is ignored");
+
+		// Spread sample: a serpentine whole-map list starting in the north.
+		std::vector<std::pair<float, float>> points;
+		for (int cy = 40; cy >= -40; --cy)
+			for (int cx = -50; cx <= 50; ++cx)
+				points.emplace_back(cx * kCellUnits, cy * kCellUnits);
+		const auto picks = BP::SpreadSample(points, 30);
+		int        north = 0, south = 0, west = 0, east = 0;
+		for (const auto idx : picks) {
+			north += points[idx].second > 0 ? 1 : 0;
+			south += points[idx].second < 0 ? 1 : 0;
+			west += points[idx].first < 0 ? 1 : 0;
+			east += points[idx].first > 0 ? 1 : 0;
+		}
+		const std::set<std::size_t> uniquePicks(picks.begin(), picks.end());
+		Check(picks.size() == 30 && uniquePicks.size() == 30, "spread sample: 30 different shots");
+		Check(north >= 10 && south >= 10 && west >= 10 && east >= 10, "spread sample: north, south, west and east all sampled (not just the first rows)");
+		Check(BP::SpreadSample(points, 30) == picks, "spread sample: the same list gives the same picks (resume)");
+		// An L-shaped land mass with empty sea squares still yields the full count.
+		std::vector<std::pair<float, float>> coast;
+		for (int i = 0; i < 400; ++i)
+			coast.emplace_back(static_cast<float>(i % 20) * kCellUnits, i < 200 ? 0.0f : static_cast<float>(i / 20) * kCellUnits);
+		Check(BP::SpreadSample(coast, 30).size() == 30, "spread sample: empty sea squares are made up with a finer grid");
+		const std::vector<std::pair<float, float>> few{ { 0.0f, 0.0f }, { 1.0f, 1.0f } };
+		Check(BP::SpreadSample(few, 30).size() == 2 && BP::SpreadSample({}, 30).empty() && BP::SpreadSample(points, 0).empty(), "spread sample: fewer shots than wanted -> all; none -> none");
+
+		// Planned restarts.
+		Check(!BP::RestartDue(499, 500) && BP::RestartDue(500, 500) && BP::RestartDue(501, 500), "restart: due once this run has taken iRestartEvery photos");
+		Check(!BP::RestartDue(100000, 0) && !BP::RestartDue(0, 500) && !BP::RestartDue(5, -3), "restart: 0 or less = off; nothing taken = never");
+
+		// Retry pass bookkeeping.
+		BP::RetryBook book;
+		Check(book.FailedCells() == 0 && book.Failed().empty() && !book.InRetry(), "retry: starts empty");
+		book.Fail(3, 4);
+		book.Fail(9, 2);
+		Check(book.FailedCells() == 6 && book.Failed() == std::vector<std::size_t>{ 3, 9 }, "retry: failed shots and their cells are counted");
+		const auto again = book.StartRetry();
+		Check(again == std::vector<std::size_t>{ 3, 9 } && book.InRetry() && book.Failed().empty() && book.FailedCells() == 0, "retry: the failed shots are handed out once");
+		book.Fail(12, 4);
+		Check(book.StartRetry().empty() && book.Failed() == std::vector<std::size_t>{ 12 } && book.FailedCells() == 4, "retry: only one retry pass; failures in it stay as missing");
+		BP::RetryBook clean;
+		Check(clean.StartRetry().empty() && clean.InRetry(), "retry: nothing failed -> no retry pass");
+		std::ostringstream missing;
+		BP::WriteMissing(missing, { BP::ShotKey("Tamriel", -3, 7), BP::ShotKey("WhiterunWorld", 1, 2) });
+		Check(missing.str() == "Tamriel -3 7\nWhiterunWorld 1 2\n", "missing list: one cell key per line");
+
+		// Append-only progress: a whole file plus appended lines (and a torn last line after a crash) reads back.
+		BP::Progress start;
+		start.grid = 1;
+		start.toneKnown = true;
+		start.tone = tone;
+		start.done = { BP::ShotKey("Tamriel", 0, 0) };
+		std::ostringstream progressText;
+		BP::WriteProgress(progressText, start);
+		BP::AppendDone(progressText, BP::ShotKey("Tamriel", 1, 0));
+		BP::AppendDone(progressText, BP::ShotKey("Tamriel", -2, 5));
+		std::istringstream progressIn(progressText.str() + "done Tamr");
+		const auto         progressBack = BP::ParseProgress(progressIn, 1);
+		Check(progressBack.done.size() == 3 && progressBack.done.contains(BP::ShotKey("Tamriel", -2, 5)) && progressBack.toneKnown && progressBack.droppedGrid == 0,
+			"progress: appended shots read back, a torn last line is ignored");
+		std::ostringstream appendedOnly;
+		BP::AppendDone(appendedOnly, BP::ShotKey("Tamriel", 4, 4));
+		Check(appendedOnly.str() == "done Tamriel 4 4\n", "progress: one appended line per shot, same format as the whole file");
+	}
+
+	// Photo Baker app: restart budget, stall watchdog, missing list, tone.txt reading and master colour.
+	void TestPhotoBakerRules()
+	{
+		using namespace PhotoBaker;
+
+		// DecideRestart.
+		const auto crash = DecideRestart(GameExit::kCrash, 3, 3, 10, 10);
+		Check(crash.relaunch && crash.restartsLeft == 2 && crash.usedBudget && !crash.budgetRefilled, "restart budget: a crash without progress uses one restart");
+		const auto refilled = DecideRestart(GameExit::kCrash, 1, 3, 10, 20);
+		Check(refilled.relaunch && refilled.budgetRefilled && refilled.usedBudget && refilled.restartsLeft == 2, "restart budget: progress refills the budget, then the crash uses one");
+		const auto empty = DecideRestart(GameExit::kCrash, 0, 3, 10, 10);
+		Check(!empty.relaunch && empty.restartsLeft == 0 && !empty.usedBudget, "restart budget: none left and no progress -> no relaunch");
+		const auto planned = DecideRestart(GameExit::kPlannedRestart, 2, 3, 10, 10), plannedAtZero = DecideRestart(GameExit::kPlannedRestart, 0, 3, 10, 10);
+		Check(planned.relaunch && planned.restartsLeft == 2 && !planned.usedBudget && plannedAtZero.relaunch && plannedAtZero.restartsLeft == 0,
+			"restart budget: a planned restart always relaunches and never uses the budget");
+		const auto stuck = DecideRestart(GameExit::kStuck, 3, 3, 10, 10), stuckEmpty = DecideRestart(GameExit::kStuck, 0, 3, 10, 10);
+		Check(stuck.relaunch == crash.relaunch && stuck.restartsLeft == crash.restartsLeft && stuck.usedBudget && !stuckEmpty.relaunch, "restart budget: a stuck exit follows the crash rules");
+		Check(!DecideRestart(GameExit::kCrash, 0, 0, 10, 20).relaunch, "restart budget: 0 restarts allowed -> no relaunch, even after progress");
+
+		// IsStalled.
+		constexpr std::uint64_t launch = 1000, limit = 300'000, stallAt = launch + kStartAllowanceMs + limit;
+		Check(!IsStalled("running", stallAt * 10, 0, launch, 0), "stall: limit 0 = never");
+		Check(!IsStalled("running", launch + 100'000, 0, launch, limit) && !IsStalled("running", stallAt - 1, 0, launch, limit), "stall: not inside the start allowance plus the limit");
+		Check(IsStalled("running", stallAt, 0, launch, limit) && IsStalled("", stallAt, 0, launch, limit), "stall: true at exactly the allowance plus the limit");
+		bool quietStates = true;
+		for (const auto* state : { "writing", "done", "cancelled", "error", "restart" })
+			quietStates &= !IsStalled(state, stallAt * 2, 0, launch, limit);
+		Check(quietStates, "stall: never while writing, finished, cancelled, failed or restarting");
+		Check(!IsStalled("running", stallAt, stallAt - 10, launch, limit) && IsStalled("running", stallAt - 10 + limit, stallAt - 10, launch, limit), "stall: progress resets the clock");
+		Check(!IsStalled("running", 5, 50'000'000, launch, limit), "stall: a clock before the last progress is not a stall");
+
+		// MissingCellKeys.
+		Check(MissingCellKeys("Tamriel 1 2\r\n\r\n  WhiterunWorld 3 4  \r\nTamriel -1 -2") == std::vector<std::string>{ "Tamriel 1 2", "WhiterunWorld 3 4", "Tamriel -1 -2" },
+			"missing list: CRLF, blank lines, spaces and no final newline");
+		Check(MissingCellKeys("").empty() && MissingCellKeys("\r\n \n").empty(), "missing list: empty text -> no keys");
+		std::ostringstream pluginMissing;
+		BakePlan::WriteMissing(pluginMissing, { "Tamriel 5 -6", "SolitudeWorld -60 26" });
+		Check(MissingCellKeys(pluginMissing.str()) == std::vector<std::string>{ "Tamriel 5 -6", "SolitudeWorld -60 26" }, "missing list: reads the plugin's file");
+
+		// ParseToneText, against the plugin's tone.txt writer.
+		BakeImage::Tone tone;
+		tone.fitted = true;
+		for (int v = 0; v < 256; ++v)
+			tone.lut[v] = static_cast<float>(v) * 0.913579f + 2.0f / 7.0f;
+		tone.gain = { 1.0432101f, 0.97654f, 1.0f / 3.0f };
+		std::ostringstream written;
+		BakePlan::WriteToneText(written, tone);
+		BakeImage::Tone read;
+		Check(ParseToneText(written.str(), read) && read.fitted && read.lut == tone.lut && read.gain == tone.gain, "app tone.txt: reads the plugin's file exactly");
+		std::ostringstream fallbackWritten;
+		BakePlan::WriteToneText(fallbackWritten, BakeImage::Tone{});
+		Check(ParseToneText(fallbackWritten.str(), read) && !read.fitted, "app tone.txt: reads the plugin's fallback tone");
+		Check(ParseToneText("fitted 0", read) && !read.fitted && read.gain[0] == 1.0f, "app tone.txt: fitted 0 alone is the fallback tone");
+		std::string lut256 = "lut";
+		for (int v = 0; v < 256; ++v)
+			lut256 += " " + std::to_string(v);
+		const std::string lut255 = lut256.substr(0, lut256.rfind(' ')), lut257 = lut256 + " 256";
+		Check(!ParseToneText("fitted 1\ngain 1 1 1\n", read) && !ParseToneText("fitted 1\n" + lut256, read), "app tone.txt: fitted 1 without lut or gain fails");
+		Check(!ParseToneText("fitted 1\ngain 1 1 1\n" + lut255, read) && !ParseToneText("fitted 1\ngain 1 1 1\n" + lut257, read), "app tone.txt: 255 or 257 lut numbers fail");
+		Check(!ParseToneText("fitted 1\ngain 1 x 1\n" + lut256, read) && !ParseToneText("fitted 2", read), "app tone.txt: a bad number fails");
+		Check(ParseToneText("fitted 0\ncolour 5 5\n", read) && !ParseToneText("gain 1 1 1\n" + lut256, read), "app tone.txt: unknown keys ignored, no fitted line fails");
+		read = tone;
+		Check(!ParseToneText("fitted 1\ngain 1 1\n", read) && !read.fitted && read.gain[1] == 1.0f && read.lut[100] == 0.0f, "app tone.txt: a failure leaves the unfitted fallback");
+		Check(ParseToneText("fitted 1\r\ngain 0.5 0.5 0.5\r\n" + lut256 + "\r\n", read) && read.gain[2] == 0.5f && read.lut[255] == 255.0f, "app tone.txt: \"0.5\" reads as 0.5 (no locale), CRLF");
+
+		// ApplyRecolour.
+		std::vector<std::uint8_t> pixels{ 100, 50, 0, 250, 250, 250, 77, 77, 77 }, same = pixels;
+		ApplyRecolour({}, same);
+		Check(same == pixels, "recolour: neutral leaves the bytes alone");
+		std::vector<std::uint8_t> brighter = pixels;
+		ApplyRecolour({ 1.2f, 1.0f }, brighter);
+		Check(brighter[3] == 255 && brighter[0] == 120 && brighter[1] == 60 && brighter[2] == 0, "recolour: brightness 1.2 scales and clamps at 255");
+		std::vector<std::uint8_t> duller = pixels;
+		ApplyRecolour({ 1.0f, 0.8f }, duller);
+		Check(duller[6] == 77 && duller[7] == 77 && duller[8] == 77, "recolour: saturation 0.8 leaves grey alone");
+		Check(duller[0] == 90 && duller[1] == 50 && duller[2] == 10, "recolour: saturation 0.8 of 100,50,0 -> 90,50,10");
+
+		// ToneMasterRgba == the plugin's ApplyTone with a neutral recolour; alpha untouched.
+		bool sameAsPlugin = true;
+		for (const auto& useTone : { tone, BakeImage::Tone{} }) {
+			std::vector<std::uint8_t> rgba(64 * 4), rgb(64 * 3);
+			for (std::size_t p = 0; p < 64; ++p) {
+				for (int c = 0; c < 3; ++c)
+					rgba[p * 4 + c] = rgb[p * 3 + c] = static_cast<std::uint8_t>((p * 37 + c * 91) % 256);
+				rgba[p * 4 + 3] = 0x37;
+			}
+			ToneMasterRgba(useTone, {}, rgba);
+			BakeImage::ApplyTone(useTone, rgb);
+			for (std::size_t p = 0; p < 64; ++p)
+				sameAsPlugin &= rgba[p * 4] == rgb[p * 3] && rgba[p * 4 + 1] == rgb[p * 3 + 1] && rgba[p * 4 + 2] == rgb[p * 3 + 2] && rgba[p * 4 + 3] == 0x37;
+		}
+		Check(sameAsPlugin, "master tone: same bytes as the plugin's ApplyTone (fitted and fallback), alpha untouched");
+
+		// ColourStamp.
+		const auto stamp = ColourStamp(written.str(), {});
+		Check(stamp == ColourStamp(written.str(), {}) && stamp != ColourStamp(written.str(), { 1.1f, 1.0f }) && stamp != ColourStamp(written.str(), { 1.0f, 0.9f }) &&
+				  stamp != ColourStamp(fallbackWritten.str(), {}),
+			"colour stamp: changes with brightness, saturation and tone text only");
+	}
+
 	void TestBakeDds(ID3D11Device* a_dev)
 	{
 		std::vector<std::uint8_t> rgb(512 * 512 * 3);
@@ -1172,6 +2062,207 @@ namespace
 		if (srv)
 			srv->GetDesc(&d);
 		Check(SUCCEEDED(hr) && d.Format == DXGI_FORMAT_BC1_UNORM && d.Texture2D.MipLevels == 10, "bake dds loads as BC1 with 10 mips (DirectXTK)");
+	}
+
+	// A BC7 .dds as texconv writes it: DX10 header, DXGI_FORMAT_BC7_UNORM, a_mips levels (block content does not matter here).
+	std::vector<std::uint8_t> MakeBc7Dds(int a_size, int a_mips)
+	{
+		std::vector<std::uint8_t> out(4 + 124 + 20, 0);
+		const auto                put = [&](std::size_t a_at, std::uint32_t a_v) { std::memcpy(out.data() + a_at, &a_v, 4); };
+		std::memcpy(out.data(), "DDS ", 4);
+		const auto blocks = static_cast<std::uint32_t>(a_size / 4);
+		put(4, 124);
+		put(8, 0x1 | 0x2 | 0x4 | 0x1000 | 0x20000 | 0x80000);
+		put(12, static_cast<std::uint32_t>(a_size));
+		put(16, static_cast<std::uint32_t>(a_size));
+		put(20, blocks * blocks * 16);
+		put(28, static_cast<std::uint32_t>(a_mips));
+		put(76, 32);
+		put(80, 0x4);
+		std::memcpy(out.data() + 84, "DX10", 4);
+		put(108, 0x1000 | (a_mips > 1 ? 0x400000 | 0x8 : 0));
+		put(128, 98);  // DXGI_FORMAT_BC7_UNORM
+		put(132, 3);   // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+		put(140, 1);   // array size
+		for (int m = 0, size = a_size; m < a_mips; ++m, size = std::max(1, size / 2)) {
+			const std::size_t n = static_cast<std::size_t>(std::max(1, size / 4)) * std::max(1, size / 4);
+			for (std::size_t b = 0; b < n; ++b) {
+				std::uint8_t block[16]{ 0x40 };  // mode 6
+				out.insert(out.end(), block, block + 16);
+			}
+		}
+		return out;
+	}
+
+	struct LoadedTile
+	{
+		bool        loaded{ false };
+		UINT        width{ 0 };
+		UINT        mips{ 0 };
+		DXGI_FORMAT format{ DXGI_FORMAT_UNKNOWN };
+		bool        capped{ false };
+	};
+
+	LoadedTile LoadBakedTile(ID3D11Device* a_dev, const std::vector<std::uint8_t>& a_dds, int a_maxTexSize)
+	{
+		const TileId id{ kBakedLevel, -12, 7 };
+		const auto   want = TileTexturePath("Tamriel", id, false);
+		const Tile   tile = LoadTile(
+            a_dev,
+            [&](const std::string& a_path, std::vector<std::uint8_t>& a_out) {
+                if (a_path != want)
+                    return false;
+                a_out = a_dds;
+                return true;
+            },
+            "Tamriel", id, a_maxTexSize);
+		LoadedTile r;
+		if (tile.absent || !tile.diffuse)
+			return r;
+		ComPtr<ID3D11Resource> res;
+		tile.diffuse->GetResource(&res);
+		ComPtr<ID3D11Texture2D> tex;
+		if (FAILED(res.As(&tex)))
+			return r;
+		D3D11_TEXTURE2D_DESC d{};
+		tex->GetDesc(&d);
+		return { true, d.Width, d.MipLevels, d.Format, tile.capped };
+	}
+
+	// The minimap's baked tiles: BC1 from the bake at any tile size, and BC7 tiles converted from the masters.
+	void TestBakedTileFormats(ID3D11Device* a_dev)
+	{
+		std::vector<std::uint8_t> rgb(std::size_t{ 1024 } * 1024 * 3);
+		for (std::size_t i = 0; i < rgb.size(); ++i)
+			rgb[i] = static_cast<std::uint8_t>(i % 253);
+		const auto bc1 = BakeImage::EncodeDdsBc1(rgb, 1024);
+		Check(bc1.size() == 128 + 699064, "BC1 1024 px dds: 11 mips");
+
+		const auto full = LoadBakedTile(a_dev, bc1, 2048);
+		Check(full.loaded && full.width == 1024 && full.mips == 11 && full.format == DXGI_FORMAT_BC1_UNORM && !full.capped, "baked tile: BC1 1024 px loads whole when zoomed in");
+		const auto zoomedOut = LoadBakedTile(a_dev, bc1, 512);
+		Check(zoomedOut.loaded && zoomedOut.width == 512 && zoomedOut.capped, "baked tile: BC1 1024 px loads its 512 px mip when zoomed out");
+		const auto old = LoadBakedTile(a_dev, BakeImage::EncodeDdsBc1(std::span(rgb).first(std::size_t{ 512 } * 512 * 3), 512), 2048);
+		Check(old.loaded && old.width == 512 && !old.capped, "baked tile: BC1 512 px still loads (mixed sizes in one folder)");
+
+		const auto bc7 = LoadBakedTile(a_dev, MakeBc7Dds(1024, 11), 2048);
+		Check(bc7.loaded && bc7.width == 1024 && bc7.mips == 11 && bc7.format == DXGI_FORMAT_BC7_UNORM, "baked tile: BC7 1024 px with mips loads (DX10 header)");
+		const auto bc7ZoomedOut = LoadBakedTile(a_dev, MakeBc7Dds(1024, 11), 256);
+		Check(bc7ZoomedOut.loaded && bc7ZoomedOut.width == 256 && bc7ZoomedOut.capped, "baked tile: BC7 loads a smaller mip when zoomed out");
+		const auto bc7One = LoadBakedTile(a_dev, MakeBc7Dds(512, 1), 256);
+		Check(bc7One.loaded && bc7One.width == 512, "baked tile: BC7 without mips loads whole even when zoomed out");
+		auto srgb = MakeBc7Dds(512, 10);
+		const std::uint32_t kSrgb = 99;  // DXGI_FORMAT_BC7_UNORM_SRGB
+		std::memcpy(srgb.data() + 128, &kSrgb, 4);
+		const auto bc7Srgb = LoadBakedTile(a_dev, srgb, 1024);
+		Check(bc7Srgb.loaded && bc7Srgb.format == DXGI_FORMAT_BC7_UNORM, "baked tile: BC7 sRGB loads as UNORM (sRGB flag ignored, like BC1)");
+	}
+
+	// Photo Baker app: tile formats, the [Bake] switches it writes, the quality slider, and reading the masters back.
+	void TestPhotoBakerFormats()
+	{
+		using namespace PhotoBaker;
+		Check(kTileFormats[0].format == TileFormat::kBc7Max && kTileFormats[1].format == TileFormat::kBc7 && kTileFormats[2].format == TileFormat::kBc7Quick &&
+				  kTileFormats[3].format == TileFormat::kBc1,
+			"baker: formats listed slowest encode first, BC1 last");
+		bool roundTrip = true;
+		for (int i = 0; i < static_cast<int>(kTileFormats.size()); ++i) {
+			const auto format = TileFormatAt(i);
+			roundTrip &= TileFormatIndex(format) == i && TileFormatFromKey(kTileFormats[static_cast<std::size_t>(i)].key) == format;
+		}
+		Check(roundTrip, "baker: format index and settings key round trip");
+		Check(TileFormatAt(-1) == TileFormat::kBc1 && TileFormatAt(4) == TileFormat::kBc1 && TileFormatFromKey(L"") == TileFormat::kBc1 &&
+				  TileFormatFromKey(L"bc7") == TileFormat::kBc1 && kDefaultTileFormat == TileFormat::kBc1,
+			"baker: bad index or key -> BC1, the default");
+		Check(IsBc7(TileFormat::kBc7Max) && IsBc7(TileFormat::kBc7) && IsBc7(TileFormat::kBc7Quick) && !IsBc7(TileFormat::kBc1), "baker: which formats are BC7");
+
+		const auto value = [](const std::vector<std::pair<std::string, std::string>>& a_switches, const std::string& a_key) {
+			const auto it = std::ranges::find(a_switches, a_key, &std::pair<std::string, std::string>::first);
+			return it == a_switches.end() ? std::string("<missing>") : it->second;
+		};
+		bool mastersOk = true;
+		for (const auto& choice : kTileFormats) {
+			BakeChoices c;
+			c.format = choice.format;
+			mastersOk &= value(BakeSwitches(c), "bSaveMasters") == (IsBc7(choice.format) ? "true" : "false");
+		}
+		Check(mastersOk, "baker: bSaveMasters on for the three BC7 formats, off for BC1");
+		BakeChoices c;
+		c.area = 1.25f;
+		c.seconds = 9;
+		c.hideNpcs = false;
+		c.keepExisting = true;
+		c.grid = 1;
+		c.fullMap = true;
+		c.tileSize = 1024;
+		const auto sw = BakeSwitches(c);
+		Check(value(sw, "bFullMap") == "true" && value(sw, "iTileSize") == "1024" && value(sw, "iPhotoGrid") == "1" && value(sw, "fAreaScale") == "1.25" &&
+				  value(sw, "fSettleSeconds") == "9.0" && value(sw, "bHideActorsOnNextStart") == "false" && value(sw, "bKeepExistingTiles") == "true",
+			"baker: switches pass the choices through in the plugin's ini format");
+		c.area = 2.0f / 3.0f;
+		c.fullMap = false;
+		Check(value(BakeSwitches(c), "fAreaScale") == "0.67" && value(BakeSwitches(c), "bFullMap") == "false", "baker: area with two decimals, towns-only area");
+
+		Check(GridFromQuality(1) == 4 && GridFromQuality(4) == 1 && GridFromQuality(2) == 3 && GridFromQuality(3) == 2, "baker: quality slider left = 4x4, right = 1x1");
+		Check(QualityFromGrid(4) == 1 && QualityFromGrid(1) == 4 && QualityFromGrid(3) == 2 && QualityFromGrid(2) == 3, "baker: grid back to slider position");
+		Check(GridFromQuality(0) == 4 && GridFromQuality(9) == 1 && QualityFromGrid(-3) == 4 && QualityFromGrid(7) == 1, "baker: quality slider positions clamped");
+		Check(TileSizeIndex(512) == 0 && TileSizeIndex(1024) == 1 && TileSizeIndex(2048) == 0 && TileSizeIndex(0) == 0, "baker: tile size choice index, other sizes -> 512");
+	}
+
+	// Photo Baker app: the plugin's master .bmp read back, and the checks that decide which tiles still need BC7 encoding.
+	void TestPhotoBakerEncodeChecks()
+	{
+		using namespace PhotoBaker;
+		// The plugin writes the master; the app must read the same pixels back. 3x2: padded rows.
+		const std::vector<std::uint8_t> rgb{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 };
+		auto                            bmp = BakeImage::EncodeBmp24(rgb, 3, 2);
+		int                             w = 0, h = 0;
+		std::vector<std::uint8_t>       rgba;
+		const bool                      read = DecodeBmp24(bmp, w, h, rgba);
+		bool                            same = read && w == 3 && h == 2 && rgba.size() == 24;
+		for (std::size_t i = 0; same && i < 6; ++i)
+			same &= rgba[i * 4] == rgb[i * 3] && rgba[i * 4 + 1] == rgb[i * 3 + 1] && rgba[i * 4 + 2] == rgb[i * 3 + 2] && rgba[i * 4 + 3] == 255;
+		Check(same, "baker: master bmp read back: top row first, RGB, alpha 255");
+		const auto rejects = [&](std::size_t a_at, std::uint8_t a_byte) {
+			auto bad = bmp;
+			bad[a_at] = a_byte;
+			int                       bw = 0, bh = 0;
+			std::vector<std::uint8_t> out;
+			return !DecodeBmp24(bad, bw, bh, out);
+		};
+		Check(rejects(28, 32) && rejects(30, 1) && rejects(25, 0xFF) && rejects(0, 'X'), "baker: 32-bit, compressed, top-down and non-bmp files rejected");
+		Check(!DecodeBmp24(std::span(bmp).first(60), w, h, rgba) && !DecodeBmp24({}, w, h, rgba), "baker: short master files rejected");
+
+		Check(BmpWidth(bmp) == 3 && BmpWidth(std::span(bmp).first(25)) == 0 && BmpWidth({}) == 0, "baker: bmp width, short heads -> 0");
+		auto wrongMagic = bmp;
+		wrongMagic[1] = 'X';
+		auto negative = bmp;
+		const std::uint32_t minusOne = 0xFFFFFFFF, huge = 20000;
+		std::memcpy(negative.data() + 18, &minusOne, 4);
+		auto oversized = bmp;
+		std::memcpy(oversized.data() + 18, &huge, 4);
+		Check(BmpWidth(wrongMagic) == 0 && BmpWidth(negative) == 0 && BmpWidth(oversized) == 0, "baker: bmp width of a wrong magic, negative or oversized width -> 0");
+
+		const auto bc7 = MakeBc7Dds(1024, 1);
+		std::vector<std::uint8_t> rgb512(std::size_t{ 512 } * 512 * 3, 90);
+		const auto                bc1 = BakeImage::EncodeDdsBc1(rgb512, 512);
+		const auto                bc7Head = std::span(bc7).first(kDdsHeadBytes), bc1Head = std::span(bc1).first(kDdsHeadBytes);
+		Check(DdsWidth(bc7Head) == 1024 && DdsWidth(bc1Head) == 512 && DdsWidth(std::span(bc7).first(19)) == 0 && DdsWidth(bmp) == 0, "baker: dds width, short or non-dds heads -> 0");
+
+		auto srgb = bc7;
+		const std::uint32_t kSrgb = 99, kBc1Dx10 = 71;
+		std::memcpy(srgb.data() + 128, &kSrgb, 4);
+		auto dx10Bc1 = bc7;
+		std::memcpy(dx10Bc1.data() + 128, &kBc1Dx10, 4);
+		Check(IsBc7Dds(bc7Head) && IsBc7Dds(std::span(srgb).first(kDdsHeadBytes)) && !IsBc7Dds(std::span(dx10Bc1).first(kDdsHeadBytes)) && !IsBc7Dds(bc1Head) &&
+				  !IsBc7Dds(std::span(bc7).first(100)),
+			"baker: BC7 dds = DX10 header with format 98 or 99 only");
+
+		Check(EncodedSide(1024, 512) == 512 && EncodedSide(512, 512) == 512 && EncodedSide(1024, 0) == 1024 && EncodedSide(512, 1024) == 512, "baker: encoded side");
+		Check(ShouldSkipEncode(bc7Head, 1024, 200, 100), "baker: BC7 tile of the right size, newer than its master -> skipped");
+		Check(!ShouldSkipEncode(bc1Head, 512, 200, 100) && !ShouldSkipEncode(bc7Head, 512, 200, 100) && !ShouldSkipEncode(bc7Head, 1024, 100, 100) &&
+				  !ShouldSkipEncode(bc7Head, 1024, 99, 100) && !ShouldSkipEncode({}, 1024, 200, 100) && !ShouldSkipEncode(std::span(bc7).first(50), 1024, 200, 100),
+			"baker: BC1 tile, other size, not newer than the master or a short head -> encoded again");
 	}
 }
 
@@ -1189,11 +2280,22 @@ int main(int argc, char** argv)
 	TestIconMath();
 	TestSchedule();
 	TestAtlas();
+	TestFeatureHelpers();
+	TestBatch2Helpers();
 	TestNavMesh();
 	TestBakeImage();
 	TestBakeGridGeometry();
 	TestBakePlan();
+	TestBakeTileSize();
+	TestFullMapCells();
+	TestBakeQualityGuards();
+	TestBakeProgressFullMap();
+	TestBakePrebake();
+	TestPhotoBakerRules();
+	TestPhotoBakerFormats();
+	TestPhotoBakerEncodeChecks();
 	TestBtr(data);
+	TestFullMapOnLod(data);
 
 	if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)))
 		Check(false, "CoInitializeEx");
@@ -1212,9 +2314,12 @@ int main(int argc, char** argv)
 		TestWaterMosaic(dev.Get(), ctx.Get(), data, out);
 		TestRender(dev.Get(), ctx.Get(), data, out);
 		TestIconRender(dev.Get(), ctx.Get(), data, out);
+		TestFogRender(dev.Get(), ctx.Get(), data, out);
+		TestTextPreview(dev.Get(), ctx.Get(), out);
 		TestNavRender(dev.Get(), ctx.Get(), out);
 		TestWorkerException(dev.Get());
 		TestBakeDds(dev.Get());
+		TestBakedTileFormats(dev.Get());
 	}
 
 	std::printf("%d checks, %d failed\n", checks, failures);

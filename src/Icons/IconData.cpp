@@ -11,6 +11,7 @@ namespace MM::IconData
 		constexpr double kQuestInterval = 0.25;
 		constexpr double kActorInterval = 0.2;
 		constexpr double kDoorInterval = 0.5;  // only rebuilds when a door cell attached/detached or the player changed cell
+		constexpr double kNearbyInterval = 0.5;  // path trail and nearby undiscovered places
 
 		// Icon sizes in px at 1080p, before the INI scale.
 		constexpr float kSizeCity = 16.0f;
@@ -19,11 +20,23 @@ namespace MM::IconData
 		constexpr float kSizeOther = 11.0f;
 		constexpr float kSizeQuest = 17.0f;
 		constexpr float kSizeActor = 7.0f;
-		constexpr float kSizeDead = 8.0f;
+		constexpr float kSizeDead = 11.0f;
 		constexpr float kSizeDoor = 11.0f;
 		constexpr float kSizeCustom = 15.0f;
+		constexpr float kSizeHorse = 14.0f;
+		constexpr float kSizeTrail = 4.0f;
+		constexpr float kSizeNearby = 18.0f;  // '?' glyph
+		constexpr float kSizeLabel = 17.0f;   // quest distance glyphs (the ink is about half the glyph cell)
+		constexpr float kSizeService = 11.0f;
+		constexpr float kSizeDragon = 11.0f;
+
+		constexpr float kTrailSpacing = 256.0f;  // world units between trail points
 
 		std::atomic<bool> flushRequested{ true };
+
+		// Deaths reported by TESDeathEvent, handed to the actor timer. Capped like the log they feed.
+		std::mutex                       deathMutex;
+		std::vector<DeadBodyLog::Entry>  pendingDeaths;  // guarded by deathMutex
 		std::atomic<bool> doorsDirty{ true };
 
 		struct Space
@@ -51,6 +64,14 @@ namespace MM::IconData
 			return (a_rgba & 0x00FFFFFF) | (a << 24);
 		}
 
+		// What an actor is, worked out once when it first shows up in the actor sample (cached by FormID).
+		struct ActorTraits
+		{
+			ServiceKind service{ ServiceKind::kNone };
+			bool        guard{ false };
+			bool        dragon{ false };
+		};
+
 		struct ActorSample
 		{
 			RE::FormID id{ 0 };
@@ -73,6 +94,17 @@ namespace MM::IconData
 			std::vector<IconSource>  custom;
 			std::vector<IconSource>  quests;
 			std::vector<ActorSample> actors;
+			std::vector<IconSource>  questLabels;    // distance glyphs, drawn over the stars
+			std::vector<IconSource>  horse;
+			std::vector<Vec2>        hiddenMarkers;  // not yet seen map markers of this map (positions only)
+			std::vector<IconSource>  nearby;         // '?' for the hidden markers close to the player
+			TrailBuffer              trailPoints;
+			std::vector<IconSource>  trail;
+			int                      jobNearby{ -1 };
+			std::unordered_map<RE::FormID, ActorTraits>          traits;
+			DeadBodyLog                                          deadBodies;
+			std::unordered_map<RE::FormID, const RE::BGSLocation*> markerLocations;  // map marker ref -> its location
+			bool                                                 markerLocationsBuilt{ false };
 			double                   actorTime{ 0.0 };
 			bool                     anyIcons{ false };
 
@@ -82,6 +114,7 @@ namespace MM::IconData
 				jobQuest = schedule.Add(kQuestInterval);
 				jobActors = schedule.Add(kActorInterval);
 				jobDoors = schedule.Add(kDoorInterval);
+				jobNearby = schedule.Add(kNearbyInterval);
 			}
 
 			void Clear()
@@ -91,6 +124,20 @@ namespace MM::IconData
 				custom.clear();
 				quests.clear();
 				actors.clear();
+				questLabels.clear();
+				horse.clear();
+				hiddenMarkers.clear();
+				nearby.clear();
+				trailPoints.Clear();
+				trail.clear();
+				traits.clear();
+				deadBodies.Clear();
+				{
+					std::lock_guard lock(deathMutex);
+					pendingDeaths.clear();
+				}
+				markerLocations.clear();
+				markerLocationsBuilt = false;
 			}
 		};
 
@@ -100,28 +147,59 @@ namespace MM::IconData
 			return *state;
 		}
 
+		// Each location's world marker (LCTN MNAM), reversed once per game load so a marker finds its location.
+		void BuildMarkerLocations(State& a_s)
+		{
+			a_s.markerLocationsBuilt = true;
+			a_s.markerLocations.clear();
+			auto* data = RE::TESDataHandler::GetSingleton();
+			if (!data)
+				return;
+			for (const auto* loc : data->GetFormArray<RE::BGSLocation>()) {
+				if (!loc)
+					continue;
+				if (const auto marker = loc->worldLocMarker.get())
+					a_s.markerLocations.emplace(marker->GetFormID(), loc);
+			}
+		}
+
+		bool MarkerCleared(const State& a_s, const RE::TESObjectREFR* a_marker)
+		{
+			const auto it = a_s.markerLocations.find(a_marker->GetFormID());
+			return it != a_s.markerLocations.end() && it->second->IsCleared();
+		}
+
 		void GatherMarkers(State& a_s, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player)
 		{
 			a_s.markers.clear();
+			a_s.hiddenMarkers.clear();
 			const auto& ic = a_cfg.icons;
-			if (!ic.mapMarkers || !a_s.mapWorld)
+			if ((!ic.mapMarkers && !ic.undiscoveredNearby) || !a_s.mapWorld)
 				return;
+			if (ic.dimCleared && !a_s.markerLocationsBuilt)
+				BuildMarkerLocations(a_s);
 			for (const auto& handle : a_player->GetPlayerRuntimeData().currentMapMarkers) {
 				const auto ref = handle.get();
 				if (!ref || ref->IsDisabled() || ref->IsMarkedForDeletion())
 					continue;
 				const auto* extra = ref->extraList.GetByType<RE::ExtraMapMarker>();
 				const auto* data = extra ? extra->mapData : nullptr;
-				if (!data || !data->flags.all(RE::MapMarkerData::Flag::kVisible))
+				if (!data || MapRootWorld(ref->GetWorldspace()) != a_s.mapWorld)
+					continue;
+				const auto pos = ref->GetPosition();
+				// Not seen yet: only its position is kept, for the nearby '?' (no name, no type).
+				if (!data->flags.all(RE::MapMarkerData::Flag::kVisible)) {
+					if (ic.undiscoveredNearby)
+						a_s.hiddenMarkers.push_back({ pos.x, pos.y });
+					continue;
+				}
+				if (!ic.mapMarkers)
 					continue;
 				const bool discovered = data->flags.all(RE::MapMarkerData::Flag::kCanTravelTo);
 				if (!discovered && !ic.undiscovered)
 					continue;
-				if (MapRootWorld(ref->GetWorldspace()) != a_s.mapWorld)
-					continue;
 				const auto cls = ClassifyMapMarker(static_cast<int>(data->type.underlying()));
 				IconSource src;
-				const auto pos = ref->GetPosition();
 				src.world = { pos.x, pos.y };
 				src.shape = ShapeForMarkerClass(cls);
 				switch (cls) {
@@ -142,7 +220,7 @@ namespace MM::IconData
 					src.sizePx = kSizeOther;
 					break;
 				}
-				if (!discovered)
+				if (!discovered || (ic.dimCleared && MarkerCleared(a_s, ref.get())))
 					src.rgba = WithAlpha(src.rgba, 0.5f);
 				a_s.markers.push_back(src);
 			}
@@ -167,8 +245,9 @@ namespace MM::IconData
 
 		// Where to point for a quest target: the target itself when it shares our space, else the first door
 		// on the path the game keeps for the compass (TESQuestTarget::teleportPath), else nothing.
-		bool QuestPoint(const State& a_s, RE::TESObjectREFR* a_target, const RE::TESQuestTarget* a_qt, Vec2& a_out)
+		bool QuestPoint(const State& a_s, RE::TESObjectREFR* a_target, const RE::TESQuestTarget* a_qt, Vec2& a_out, bool& a_atTarget)
 		{
+			a_atTarget = true;
 			const Space ts = SpaceOf(a_target);
 			if (Valid(ts) && ts == a_s.playerSpace) {
 				const auto p = a_target->GetPosition();
@@ -179,6 +258,7 @@ namespace MM::IconData
 				if (link.ref && SpaceOf(link.ref) == a_s.playerSpace) {
 					const auto p = link.ref->GetPosition();
 					a_out = { p.x, p.y };
+					a_atTarget = false;
 					return true;
 				}
 			}
@@ -194,6 +274,7 @@ namespace MM::IconData
 		void GatherQuests(State& a_s, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player)
 		{
 			a_s.quests.clear();
+			a_s.questLabels.clear();
 			if (!a_cfg.icons.quest)
 				return;
 			// The whole pass runs under the game's lock: the game rewrites each target's teleportPath (the compass
@@ -219,7 +300,8 @@ namespace MM::IconData
 				if (!ref || ref.get() == a_player)
 					continue;
 				Vec2 point;
-				if (!QuestPoint(a_s, ref.get(), target, point))
+				bool atTarget = true;
+				if (!QuestPoint(a_s, ref.get(), target, point, atTarget))
 					continue;
 				const auto id = ref->GetFormID();
 				if (std::ranges::find(seen, id) != seen.end())
@@ -232,44 +314,331 @@ namespace MM::IconData
 				src.sizePx = kSizeQuest;
 				src.clampToRim = true;
 				a_s.quests.push_back(src);
+				if (a_cfg.icons.questDistance) {
+					// Straight to the target when it shares our space; in another cell, to the door the star points at.
+					const auto  pp = a_player->GetPosition();
+					const float dist = atTarget ? pp.GetDistance(ref->GetPosition()) : std::hypot(point.x - pp.x, point.y - pp.y);
+					AppendTextLabel(a_s.questLabels, FormatDistance(dist), point, kSizeQuest, kSizeLabel, true, a_cfg.icons.colors.questDistance,
+						a_cfg.icons.colors.textOutline);
+				}
 			}
+		}
+
+		// VendorItem* keywords in a vendor's buy/sell list -> VendorGoods bits. Keywords keep their editor IDs at runtime.
+		std::uint32_t VendorGoodsOf(const RE::BGSListForm* a_list)
+		{
+			struct KeywordGoods
+			{
+				const RE::BGSKeyword* keyword;
+				std::uint32_t         goods;
+			};
+			static const auto table = [] {
+				static constexpr std::pair<const char*, std::uint32_t> kNames[]{
+					{ "VendorItemWeapon", kGoodsWeaponsArmor },
+					{ "VendorItemArmor", kGoodsWeaponsArmor },
+					{ "VendorItemPotion", kGoodsPotions },
+					{ "VendorItemIngredient", kGoodsPotions },
+					{ "VendorItemPoison", kGoodsPotions },
+					{ "VendorItemSpellTome", kGoodsSpells },
+					{ "VendorItemScroll", kGoodsSpells },
+					{ "VendorItemStaff", kGoodsSpells },
+					{ "VendorItemFood", kGoodsFood },
+					{ "VendorItemFoodRaw", kGoodsFood },
+				};
+				std::vector<KeywordGoods> found;
+				for (const auto& [name, goods] : kNames) {
+					if (const auto* kw = RE::TESForm::LookupByEditorID<RE::BGSKeyword>(name))
+						found.push_back({ kw, goods });
+				}
+				logger::info("service icons: {} of {} vendor keywords found", found.size(), std::size(kNames));
+				return found;
+			}();
+			if (!a_list)
+				return 0;
+			std::uint32_t goods = 0;
+			for (const auto* form : a_list->forms) {
+				for (const auto& entry : table) {
+					if (form == entry.keyword)
+						goods |= entry.goods;
+				}
+			}
+			return goods;
+		}
+
+		ServiceKind ServiceOf(RE::Actor* a_actor)
+		{
+			ServiceKind kind = ServiceKind::kNone;
+			a_actor->VisitFactions([&](RE::TESFaction* a_faction, std::int8_t a_rank) {
+				if (!a_faction || a_rank < 0 || !a_faction->IsVendor())
+					return false;
+				const auto& vendor = a_faction->vendorData;
+				kind = ClassifyVendor(vendor.vendorValues.notBuySell, VendorGoodsOf(vendor.vendorSellBuyList));
+				return kind != ServiceKind::kNone;  // stop at the first vendor faction that says what they sell
+			});
+			return kind;
+		}
+
+		const ActorTraits& TraitsOf(State& a_s, RE::Actor* a_actor)
+		{
+			const auto id = a_actor->GetFormID();
+			if (const auto it = a_s.traits.find(id); it != a_s.traits.end())
+				return it->second;
+			ActorTraits traits;
+			traits.guard = a_actor->IsGuard();
+			const auto* race = a_actor->GetRace();
+			traits.dragon = race && race->HasKeywordString("ActorTypeDragon");
+			traits.service = ServiceOf(a_actor);
+			return a_s.traits.emplace(id, traits).first->second;
+		}
+
+		bool KilledByPlayer(RE::Actor* a_actor, RE::PlayerCharacter* a_player)
+		{
+			return a_actor->GetActorRuntimeData().myKiller.get().get() == a_player;
+		}
+
+		bool IsCorpse(const RE::Actor* a_actor);
+
+		// The player's last ridden mount; its info block sits elsewhere in VR.
+		RE::ActorPtr LastRiddenMount(RE::PlayerCharacter* a_player)
+		{
+			if (REL::Module::IsVR()) {
+				const auto* info = a_player->GetVRInfoRuntimeData();
+				return info ? info->lastRiddenMount.get() : RE::ActorPtr{};
+			}
+			return a_player->GetInfoRuntimeData().lastRiddenMount.get();
+		}
+
+		void GatherHorse(State& a_s, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player)
+		{
+			a_s.horse.clear();
+			if (!a_cfg.icons.horse || a_player->IsOnMount())
+				return;
+			const auto horse = LastRiddenMount(a_player);
+			if (!horse || IsCorpse(horse.get()) || horse->IsDisabled() || SpaceOf(horse.get()) != a_s.playerSpace)
+				return;
+			const auto p = horse->GetPosition();
+			IconSource src;
+			src.world = { p.x, p.y };
+			src.shape = IconShape::kHorse;
+			src.rgba = a_cfg.icons.colors.horse;
+			src.sizePx = kSizeHorse;
+			src.clampToRim = true;
+			a_s.horse.push_back(src);
+		}
+
+		// Game setting iMapMarkerVisibleDistance (12500 in Skyrim.esm): how far the compass shows map markers. Read once.
+		float UndiscoveredRadius(const Settings::Values& a_cfg)
+		{
+			static const int gameRadius = [] {
+				auto*       settings = RE::GameSettingCollection::GetSingleton();
+				auto*       setting = settings ? settings->GetSetting("iMapMarkerVisibleDistance") : nullptr;
+				const int   value = setting ? setting->GetInteger() : 0;
+				if (value > 0)
+					logger::info("nearby undiscovered places: radius {} (iMapMarkerVisibleDistance)", value);
+				else
+					logger::info("nearby undiscovered places: game setting missing, using fUndiscoveredRadius");
+				return value;
+			}();
+			return gameRadius > 0 ? static_cast<float>(gameRadius) : a_cfg.icons.undiscoveredRadius;
+		}
+
+		void GatherNearbyUndiscovered(State& a_s, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player)
+		{
+			a_s.nearby.clear();
+			IconShape question;
+			if (!a_cfg.icons.undiscoveredNearby || a_s.hiddenMarkers.empty() || !GlyphShape('?', question))
+				return;
+			const auto  pp = a_player->GetPosition();
+			const float radius = UndiscoveredRadius(a_cfg);
+			for (const auto& m : a_s.hiddenMarkers) {
+				const float dx = m.x - pp.x, dy = m.y - pp.y;
+				if (dx * dx + dy * dy > radius * radius)
+					continue;
+				IconSource src;
+				src.world = m;
+				src.shape = question;
+				src.rgba = a_cfg.icons.colors.nearby;
+				src.sizePx = kSizeNearby;
+				a_s.nearby.push_back(src);
+			}
+		}
+
+		void GatherTrail(State& a_s, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player)
+		{
+			if (!a_cfg.icons.trail) {
+				a_s.trailPoints.Clear();
+				a_s.trail.clear();
+				return;
+			}
+			const auto pp = a_player->GetPosition();
+			const bool added = a_s.trailPoints.Offer({ pp.x, pp.y }, kTrailSpacing);
+			if (!added && a_s.trail.size() == static_cast<std::size_t>(a_s.trailPoints.Size()))
+				return;  // nothing new to draw
+			a_s.trail.clear();
+			const int  count = a_s.trailPoints.Size();
+			const auto rgba = a_cfg.icons.colors.trail;
+			for (int i = 0; i < count; ++i) {
+				IconSource src;
+				src.world = a_s.trailPoints.At(i);
+				src.shape = IconShape::kCircle;
+				src.rgba = WithAlpha(rgba, TrailBuffer::AgeAlpha(i, count));
+				src.sizePx = kSizeTrail;
+				a_s.trail.push_back(src);
+			}
+		}
+
+		// Dead or dying, read from the actor's life state. Actor::IsDead() (a virtual with an "essential" flag) is not
+		// trusted alone for this: a body counts when either says so.
+		bool IsCorpse(const RE::Actor* a_actor)
+		{
+			const auto* state = a_actor->AsActorState();
+			const auto  life = state ? state->GetLifeState() : RE::ACTOR_LIFE_STATE::kAlive;
+			return life == RE::ACTOR_LIFE_STATE::kDead || life == RE::ACTOR_LIFE_STATE::kDying || a_actor->IsDead();
+		}
+
+		// Why a logged body leaves the list, or nullptr to keep it.
+		const char* DeadBodyDropReason(const State& a_s, const RE::Actor* a_actor)
+		{
+			if (!a_actor)
+				return "no longer exists";
+			if (a_actor->IsDeleted() || a_actor->IsMarkedForDeletion())
+				return "deleted";
+			if (!a_actor->Is3DLoaded())
+				return "unloaded";
+			if (!IsCorpse(a_actor))
+				return "alive again";
+			if (SpaceOf(a_actor) != a_s.playerSpace)
+				return "in another space";
+			return nullptr;
+		}
+
+		bool WithinReach(const RE::NiPoint3& a_p, const RE::NiPoint3& a_player, float a_reach)
+		{
+			const float dx = a_p.x - a_player.x, dy = a_p.y - a_player.y;
+			return dx * dx + dy * dy <= a_reach * a_reach;
+		}
+
+		ActorSample DeadCross(const RE::Actor* a_actor, const Settings::Values& a_cfg)
+		{
+			const auto  p = a_actor->GetPosition();
+			ActorSample a;
+			a.id = a_actor->GetFormID();
+			a.cur = a.prev = { p.x, p.y };
+			a.shape = IconShape::kCross;
+			a.rgba = a_cfg.icons.colors.dead;
+			a.size = kSizeDead;
+			return a;
+		}
+
+		// Bodies from the death events: the dead often leave the high process list, so the list alone misses them.
+		// Entries that unloaded, were deleted, came back to life or are in another space are dropped here.
+		void AddLoggedDeadBodies(State& a_s, const Settings::Values& a_cfg, const RE::NiPoint3& a_pp, float a_reach, std::vector<RE::FormID>& a_seen,
+			std::vector<ActorSample>& a_out)
+		{
+			{
+				std::lock_guard lock(deathMutex);
+				for (const auto& death : pendingDeaths) {
+					if (a_s.deadBodies.Add(death.formId, death.killedByPlayer))
+						logger::debug("dead bodies: added {:08X} (killed by player: {}), {} listed", death.formId, death.killedByPlayer, a_s.deadBodies.Entries().size());
+				}
+				pendingDeaths.clear();
+			}
+			a_s.deadBodies.RemoveIf([&](const DeadBodyLog::Entry& a_entry) {
+				const char* reason = DeadBodyDropReason(a_s, RE::TESForm::LookupByID<RE::Actor>(a_entry.formId));
+				if (reason)
+					logger::debug("dead bodies: dropped {:08X}: {}", a_entry.formId, reason);
+				return reason != nullptr;
+			});
+			if (a_cfg.icons.dead == DeadMode::kOff)
+				return;
+			for (const auto& entry : a_s.deadBodies.Entries()) {
+				if (!ShowsDeadBody(a_cfg.icons.dead, entry.killedByPlayer) || std::ranges::find(a_seen, entry.formId) != a_seen.end())
+					continue;
+				const auto* actor = RE::TESForm::LookupByID<RE::Actor>(entry.formId);
+				if (!actor || actor->IsDisabled() || !WithinReach(actor->GetPosition(), a_pp, a_reach))
+					continue;
+				a_seen.push_back(entry.formId);
+				a_out.push_back(DeadCross(actor, a_cfg));
+			}
+		}
+
+		// Debug log only: dead actors seen in each process list, once when the counts change.
+		void LogListedDeadCounts(int a_high, int a_middleHigh)
+		{
+			static int lastHigh = -1, lastMiddleHigh = -1;
+			if (a_high == lastHigh && a_middleHigh == lastMiddleHigh)
+				return;
+			lastHigh = a_high;
+			lastMiddleHigh = a_middleHigh;
+			logger::debug("dead bodies: {} dead in the high process list, {} in middle-high (in reach)", a_high, a_middleHigh);
+		}
+
+		// iDead = 2: bodies still in the process lists we can read cheaply (middle-high holds many of the recently dead).
+		// Returns how many dead actors in reach the list held.
+		int AddListedDeadBodies(const RE::BSTArray<RE::ActorHandle>& a_handles, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player,
+			const RE::NiPoint3& a_pp, float a_reach, std::vector<RE::FormID>& a_seen, std::vector<ActorSample>& a_out)
+		{
+			int found = 0;
+			for (const auto& handle : a_handles) {
+				const auto actor = handle.get();
+				if (!actor || actor.get() == a_player || actor->IsDisabled() || !actor->Is3DLoaded() || !IsCorpse(actor.get()))
+					continue;
+				if (!WithinReach(actor->GetPosition(), a_pp, a_reach))
+					continue;
+				++found;
+				if (std::ranges::find(a_seen, actor->GetFormID()) != a_seen.end())
+					continue;
+				a_seen.push_back(actor->GetFormID());
+				a_out.push_back(DeadCross(actor.get(), a_cfg));
+			}
+			return found;
 		}
 
 		void GatherActors(State& a_s, double a_now, const Settings::Values& a_cfg, RE::PlayerCharacter* a_player, float a_radius)
 		{
 			const auto& ic = a_cfg.icons;
 			std::vector<ActorSample> next;
+			std::vector<RE::FormID>  deadSeen;
+			int                      deadInHigh = 0;
+			const auto               pp = a_player->GetPosition();
+			const float              reach = a_radius * 1.5f;
 			auto*                    lists = RE::ProcessLists::GetSingleton();
-			if (lists && (ic.hostile || ic.follower || ic.neutral || ic.dead)) {
-				const auto  pp = a_player->GetPosition();
-				const float reach = a_radius * 1.5f;
+			if (lists) {  // always: dragons are shown whatever the other actor options say
 				for (const auto& handle : lists->highActorHandles) {
 					const auto actor = handle.get();
 					if (!actor || actor.get() == a_player || actor->IsDisabled() || !actor->Is3DLoaded())
 						continue;
 					const auto p = actor->GetPosition();
-					const float dx = p.x - pp.x, dy = p.y - pp.y;
-					if (dx * dx + dy * dy > reach * reach)
+					if (!WithinReach(p, pp, reach))
 						continue;
 					ActorSample a;
-					if (actor->IsDead()) {
-						if (!ic.dead)
+					if (IsCorpse(actor.get())) {
+						++deadInHigh;
+						// The killer is only looked up when the mode needs it; the death log below covers the rest.
+						if (!ShowsDeadBody(ic.dead, ic.dead == DeadMode::kPlayerKills && KilledByPlayer(actor.get(), a_player)))
 							continue;
-						a.shape = IconShape::kCross;
-						a.rgba = ic.colors.dead;
-						a.size = kSizeDead;
+						deadSeen.push_back(actor->GetFormID());
+						next.push_back(DeadCross(actor.get(), a_cfg));
+						continue;
+					} else if (const auto& traits = TraitsOf(a_s, actor.get()); traits.dragon) {
+						a.rgba = ic.colors.dragon;
+						a.size = kSizeDragon;
 					} else if (actor->IsPlayerTeammate()) {
 						if (!ic.follower)
 							continue;
 						a.rgba = ic.colors.follower;
-					} else if (actor->IsHostileToActor(a_player)) {
+					} else if (CountsAsEnemy(actor->IsHostileToActor(a_player), actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kConfidence))) {
 						if (!ic.hostile)
 							continue;
 						a.rgba = ic.colors.hostile;
+					} else if (ic.services && traits.service != ServiceKind::kNone) {
+						a.shape = ShapeForService(traits.service);
+						a.rgba = ic.colors.service;
+						a.size = kSizeService;
 					} else {
 						if (!ic.neutral)
 							continue;
-						a.rgba = ic.colors.neutral;
+						a.rgba = traits.guard ? ic.colors.guard : ic.colors.neutral;
 					}
 					a.id = actor->GetFormID();
 					a.cur = { p.x, p.y };
@@ -285,7 +654,10 @@ namespace MM::IconData
 					}
 					next.push_back(a);
 				}
+				if (ic.dead == DeadMode::kAll)
+					LogListedDeadCounts(deadInHigh, AddListedDeadBodies(lists->middleHighActorHandles, a_cfg, a_player, pp, reach, deadSeen, next));
 			}
+			AddLoggedDeadBodies(a_s, a_cfg, pp, reach, deadSeen, next);
 			a_s.actors = std::move(next);
 			a_s.actorTime = a_now;
 		}
@@ -336,6 +708,7 @@ namespace MM::IconData
 
 		class EventSink :
 			public RE::BSTEventSink<RE::TESCellAttachDetachEvent>,
+			public RE::BSTEventSink<RE::TESDeathEvent>,
 			public RE::BSTEventSink<RE::MenuOpenCloseEvent>
 		{
 		public:
@@ -352,6 +725,23 @@ namespace MM::IconData
 					if (base && base->Is(RE::FormType::Door))
 						doorsDirty.store(true, std::memory_order_relaxed);
 				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Sent twice per death (dying, then dead); DeadBodyLog merges the two.
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESDeathEvent* a_event, RE::BSTEventSource<RE::TESDeathEvent>*) override
+			{
+				if (!a_event || !a_event->actorDying)
+					return RE::BSEventNotifyControl::kContinue;
+				const auto* player = RE::PlayerCharacter::GetSingleton();
+				const bool  byPlayer = player && a_event->actorKiller.get() == player;
+				logger::debug("dead bodies: death event for {:08X} (form type {}), dead {}, killer {:08X}", a_event->actorDying->GetFormID(),
+					static_cast<int>(a_event->actorDying->GetFormType()), a_event->dead, a_event->actorKiller ? a_event->actorKiller->GetFormID() : 0u);
+				if (!a_event->actorDying->Is(RE::FormType::ActorCharacter))
+					return RE::BSEventNotifyControl::kContinue;
+				std::lock_guard lock(deathMutex);
+				if (pendingDeaths.size() < static_cast<std::size_t>(DeadBodyLog::kCapacity))
+					pendingDeaths.push_back({ a_event->actorDying->GetFormID(), byPlayer });
 				return RE::BSEventNotifyControl::kContinue;
 			}
 
@@ -374,8 +764,11 @@ namespace MM::IconData
 
 	void RegisterEvents()
 	{
-		if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton())
+		if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
 			holder->AddEventSink<RE::TESCellAttachDetachEvent>(EventSink::GetSingleton());
+			holder->AddEventSink<RE::TESDeathEvent>(EventSink::GetSingleton());
+			logger::info("death event sink registered (dead body crosses)");
+		}
 		if (auto* ui = RE::UI::GetSingleton())
 			ui->AddEventSink<RE::MenuOpenCloseEvent>(EventSink::GetSingleton());
 		logger::info("icon event sinks registered");
@@ -417,6 +810,9 @@ namespace MM::IconData
 			if (worldChanged || space.interior)
 				s.schedule.Force(s.jobMarkers);
 			s.actors.clear();
+			s.trailPoints.Clear();  // a new cell or worldspace starts a new trail
+			s.trail.clear();
+			s.schedule.Force(s.jobNearby);
 		}
 
 		const auto due = s.schedule.Tick(a_now);
@@ -426,8 +822,14 @@ namespace MM::IconData
 			GatherQuests(s, a_cfg, a_player);
 			GatherCustomMarker(s, a_cfg, a_player);
 		}
-		if (due & (1u << s.jobActors))
+		if (due & (1u << s.jobActors)) {
 			GatherActors(s, a_now, a_cfg, a_player, a_radius);
+			GatherHorse(s, a_cfg, a_player);
+		}
+		if (due & (1u << s.jobNearby)) {
+			GatherTrail(s, a_cfg, a_player);
+			GatherNearbyUndiscovered(s, a_cfg, a_player);
+		}
 		if ((due & (1u << s.jobDoors)) && doorsDirty.exchange(false, std::memory_order_relaxed))
 			GatherDoors(s, a_cfg, a_player);
 	}
@@ -437,9 +839,12 @@ namespace MM::IconData
 		const auto& s = S();
 		if (!s.anyIcons)
 			return;
+		a_out.insert(a_out.end(), s.trail.begin(), s.trail.end());
 		a_out.insert(a_out.end(), s.markers.begin(), s.markers.end());
+		a_out.insert(a_out.end(), s.nearby.begin(), s.nearby.end());
 		a_out.insert(a_out.end(), s.doors.begin(), s.doors.end());
 		a_out.insert(a_out.end(), s.custom.begin(), s.custom.end());
+		a_out.insert(a_out.end(), s.horse.begin(), s.horse.end());
 		const float t = static_cast<float>(std::clamp((a_now - s.actorTime) / kActorInterval, 0.0, 1.0));
 		for (const auto& a : s.actors) {
 			IconSource src;
@@ -450,6 +855,7 @@ namespace MM::IconData
 			a_out.push_back(src);
 		}
 		a_out.insert(a_out.end(), s.quests.begin(), s.quests.end());
+		a_out.insert(a_out.end(), s.questLabels.begin(), s.questLabels.end());
 	}
 
 	Counts GetCounts()

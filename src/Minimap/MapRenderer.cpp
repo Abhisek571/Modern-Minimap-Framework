@@ -19,6 +19,8 @@ namespace MM
 			float shade[4];
 			float grade[4];
 			float water[4];
+			float fog[4];     // fog mask uv rect of this tile (north-west, south-east)
+			float fogOn[4];   // x = darkness, y = on
 		};
 
 		struct OverlayCB
@@ -515,6 +517,11 @@ namespace MM
 		const float invLz = lz > 0.05f ? 1.0f / lz : 20.0f;
 
 		const float size = static_cast<float>(_targetSize);
+		const auto& f = a_params.fog;
+		const bool  fogOn = f.enabled && _fogSRV && f.world.maxX > f.world.minX && f.world.maxY > f.world.minY;
+		const float fogW = fogOn ? f.world.maxX - f.world.minX : 1.0f, fogH = fogOn ? f.world.maxY - f.world.minY : 1.0f;
+		if (fogOn)
+			a_ctx->PSSetShaderResources(3, 1, _fogSRV.GetAddressOf());
 		for (const auto& t : a_tiles) {
 			if (!t.diffuse)
 				continue;
@@ -525,12 +532,15 @@ namespace MM
 				continue;
 			const bool hasWater = s.water && t.water;
 			const bool baked = t.id.lvl == kBakedLevel;  // finished picture: draw as is (shade 1, no grading)
+			const bool fogged = fogOn && (!baked || f.inTowns);
 			TileCB     cb{
                 { tl.x / size * 2 - 1, 1 - tl.y / size * 2, br.x / size * 2 - 1, 1 - br.y / size * 2 },
                 { lx, ly, lz, invLz },
                 { s.ambient, s.diffuse, s.shadeMin, s.shadeMax },
                 { s.brightness, s.saturation, t.normal ? 1.0f : 0.0f, hasWater ? 1.0f : 0.0f },
-                { s.waterR, s.waterG, s.waterB, s.waterAlpha }
+                { s.waterR, s.waterG, s.waterB, s.waterAlpha },
+                { (r.minX - f.world.minX) / fogW, (f.world.maxY - r.maxY) / fogH, (r.maxX - f.world.minX) / fogW, (f.world.maxY - r.minY) / fogH },
+                { f.darkness, fogged ? 1.0f : 0.0f, 0.0f, 0.0f }
 			};
 			if (baked) {
 				const float shade[4]{ 1.0f, 0.0f, 0.0f, 2.0f };  // s = 1
@@ -544,6 +554,36 @@ namespace MM
 			a_ctx->Draw(4, 0);
 		}
 		a_ctx->PSSetShaderResources(0, 3, nullSRV);
+		if (fogOn)
+			a_ctx->PSSetShaderResources(3, 1, nullSRV);
+	}
+
+	bool MapRenderer::SetFogMask(ID3D11DeviceContext* a_ctx, std::span<const std::uint8_t> a_pixels, int a_size)
+	{
+		if (!_device || a_size <= 0 || a_pixels.size() < static_cast<std::size_t>(a_size) * static_cast<std::size_t>(a_size))
+			return false;
+		if (!_fog || _fogSize != a_size) {
+			_fog.Reset();
+			_fogSRV.Reset();
+			_fogSize = 0;
+			D3D11_TEXTURE2D_DESC td{};
+			td.Width = td.Height = static_cast<UINT>(a_size);
+			td.MipLevels = td.ArraySize = 1;
+			td.Format = DXGI_FORMAT_R8_UNORM;
+			td.SampleDesc.Count = 1;
+			td.Usage = D3D11_USAGE_DEFAULT;
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			const D3D11_SUBRESOURCE_DATA init{ a_pixels.data(), static_cast<UINT>(a_size), 0 };
+			if (FAILED(_device->CreateTexture2D(&td, &init, &_fog)) || FAILED(_device->CreateShaderResourceView(_fog.Get(), nullptr, &_fogSRV))) {
+				_fog.Reset();
+				_fogSRV.Reset();
+				return false;
+			}
+			_fogSize = a_size;
+			return true;
+		}
+		a_ctx->UpdateSubresource(_fog.Get(), 0, nullptr, a_pixels.data(), static_cast<UINT>(a_size), 0);
+		return true;
 	}
 
 	void MapRenderer::DrawOverlay(ID3D11DeviceContext* a_ctx, const OverlayParams& a_p)

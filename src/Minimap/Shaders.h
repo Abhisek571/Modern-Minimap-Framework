@@ -16,6 +16,8 @@ cbuffer TileCB : register(b0)
 	float4 tShade;  // ambient, diffuse, min, max
 	float4 tGrade;  // brightness, saturation, hasNormal, hasWater
 	float4 tWater;  // rgb, alpha
+	float4 tFog;    // fog mask uv of the tile's north-west and south-east corners
+	float4 tFogOn;  // x = darkness, y = on
 };
 
 cbuffer OverlayCB : register(b0)
@@ -46,6 +48,7 @@ cbuffer NavCB : register(b0)
 Texture2D    texA : register(t0);
 Texture2D    texB : register(t1);
 Texture2D    texC : register(t2);
+Texture2D    texFog : register(t3);
 SamplerState samp : register(s0);
 
 // The minimap's colours are sRGB. A HUD target that is sRGB-typed or float (HDR) expects linear values.
@@ -79,6 +82,10 @@ float4 PSTile(VSOut i) : SV_Target
 	if (tGrade.z > 0.5) {
 		float3 t = texB.Sample(samp, i.uv).rgb * 2 - 1;  // object space: R = east, G = up, B = north
 		n = normalize(float3(t.r, t.b, t.g) + 1e-6);
+		// Terrain never faces down. A normal that does comes from a damaged map (texture tools that resize
+		// with alpha-weighted filtering wreck xLODGen normals, whose alpha is near zero): use flat ground.
+		if (n.z < 0.2)
+			n = float3(0, 0, 1);
 	}
 	float s = clamp(tShade.x + tShade.y * saturate(dot(n, tLight.xyz)) * tLight.w, tShade.z, tShade.w);
 	float3 c = saturate(d * s * tGrade.x);
@@ -86,6 +93,10 @@ float4 PSTile(VSOut i) : SV_Target
 	c = saturate(g + (c - g) * tGrade.y);
 	if (tGrade.w > 0.5) {
 		c = lerp(c, tWater.rgb, tWater.a * texC.Sample(samp, i.uv).r);
+	}
+	if (tFogOn.y > 0.5) {
+		float explored = texFog.Sample(samp, lerp(tFog.xy, tFog.zw, i.uv)).r;
+		c *= lerp(1 - tFogOn.x, 1, explored);
 	}
 	return float4(c, 1);
 }

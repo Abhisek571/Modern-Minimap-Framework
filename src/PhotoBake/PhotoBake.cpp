@@ -43,14 +43,24 @@ namespace MM::Bake
 		constexpr float kFogToggleWait = 2.0f;  // after tfog, before the second picture
 		constexpr float kLoadTimeout = 240.0f;  // unpaused seconds before a spot that never loads is skipped
 		constexpr float kCaptureTimeout = 15.0f;
-		constexpr float kFlatContrast = 15.0f;  // centre luma deviation below this: a flat, fogged-out photo (normal ones are 40+)
 		constexpr float kPlayerAboveGround = 300.0f;
 		constexpr int   kHudFrames = 3;         // frames between hiding the HUD and copying the picture
 		constexpr int   kFitShots = 30;         // photos sampled for the colour match
 		constexpr float kCityMinRadius = 9000.0f;
+		constexpr float kLookInterval = 0.5f;   // adaptive settle: seconds between two looks at the screen
+		constexpr int   kLookSize = 64;         // adaptive settle: side of the luma thumbnail compared between looks
+		constexpr int   kSettleLogEvery = 25;   // photos between two average-settle log lines
+		constexpr int   kHighlightLogEvery = 25;  // photos between two clipped-white log lines
+		constexpr auto  kRestartState = "restart";  // status file: a planned restart, not a crash and not the end
 
 		constexpr auto kTileDir = "Data/textures/ModernMinimap/tamriel";
+		// [Bake] bSaveMasters: lossless copies of the tiles, outside textures so the game never loads them.
+		constexpr auto kMasterDir = "Data/ModernMinimapMasters/tamriel";
+		// The tone the BC1 tiles got; the masters are untoned and the Photo Baker app applies it to them.
+		constexpr auto kToneFile = "tone.txt";
 		constexpr auto kProgressPath = "Data/SKSE/Plugins/ModernMinimapBake.txt";
+		// Cells still without a photo after the retry pass, one key per line (read by the Photo Baker app).
+		constexpr auto kMissingPath = "Data/SKSE/Plugins/ModernMinimapMissing.txt";
 		// Read by the Modern Minimap Photo Baker app, which starts the game with bStartOnLoad and watches the bake.
 		constexpr auto kStatusPath = "Data/SKSE/Plugins/ModernMinimapBakeStatus.json";
 		constexpr auto kCancelPath = "Data/SKSE/Plugins/ModernMinimapBake.cancel";  // created by the app's Cancel button
@@ -223,20 +233,102 @@ namespace MM::Bake
 			return out;
 		}
 
+		// The playable map area: the point lists of the worldspace's border regions (REGN with the border flag, the
+		// invisible wall; vanilla Tamriel has one, BorderRegionSkyrim). The world map data (MNAM) is no help here: in
+		// Skyrim.esm it says usable 0 x 0 with NW -30,15 and SE 40,-40, nothing like the real border.
+		std::vector<BakePlan::Polygon> BorderPolygons(const RE::TESWorldSpace* a_world)
+		{
+			std::vector<BakePlan::Polygon> borders;
+			auto*                          dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!dataHandler)
+				return borders;
+			for (auto* region : dataHandler->GetFormArray<RE::TESRegion>()) {
+				if (!region || region->worldSpace != a_world || !(region->formFlags & RE::TESRegion::RecordFlags::kBorderRegion) || !region->pointLists)
+					continue;
+				for (auto* list : *region->pointLists) {
+					if (!list)
+						continue;
+					BakePlan::Polygon polygon;
+					for (auto* point : *list)
+						if (point)
+							polygon.emplace_back(point->point.x, point->point.y);
+					logger::info("bake: whole map: border region {:08X} {}: {} points, cells {:.1f},{:.1f} to {:.1f},{:.1f}", region->GetFormID(),
+						region->GetFormEditorID(), polygon.size(), list->minimums.x / kCellUnits, list->minimums.y / kCellUnits, list->maximums.x / kCellUnits,
+						list->maximums.y / kCellUnits);
+					if (polygon.size() >= 3)
+						borders.push_back(std::move(polygon));
+				}
+			}
+			return borders;
+		}
+
+		// Main thread, once per session: every Tamriel cell with land, from the level-4 terrain LOD meshes inside the
+		// worldspace's bounds (the same meshes the ground heights come from), clipped to the playable map area.
+		// Tiles without a mesh have no land.
+		const std::set<std::pair<int, int>>& FullMapCells()
+		{
+			static std::optional<std::set<std::pair<int, int>>> cached;
+			if (cached)
+				return *cached;
+			cached.emplace();
+			constexpr int kLevel = 4;
+			auto*         world = RE::TESForm::LookupByEditorID<RE::TESWorldSpace>(kRootWorld);
+			if (!world) {
+				logger::warn("bake: whole map: no {} worldspace", kRootWorld);
+				return *cached;
+			}
+			// The worldspace's object bounds (NAM0 / NAM9); without usable ones, a square well past vanilla Skyrim's edges.
+			constexpr int kFallbackCells = 96;
+			const bool    bounded = world->maximumCoords.x > world->minimumCoords.x && world->maximumCoords.y > world->minimumCoords.y;
+			const int     minX = FloorDiv(bounded ? WorldToCell(world->minimumCoords.x) : -kFallbackCells, kLevel) * kLevel;
+			const int     minY = FloorDiv(bounded ? WorldToCell(world->minimumCoords.y) : -kFallbackCells, kLevel) * kLevel;
+			const int     maxX = bounded ? WorldToCell(world->maximumCoords.x) : kFallbackCells;
+			const int     maxY = bounded ? WorldToCell(world->maximumCoords.y) : kFallbackCells;
+			int       meshes = 0;
+			for (int ty = minY; ty <= maxY; ty += kLevel) {
+				for (int tx = minX; tx <= maxX; tx += kLevel) {
+					const TileId              id{ kLevel, tx, ty };
+					std::vector<std::uint8_t> data;
+					BtrData                   btr;
+					std::string               error;
+					if (!Minimap::ReadGameFile(TileMeshPath(kRootWorld, id), data) || !ParseBtr(data, btr, error))
+						continue;
+					++meshes;
+					cached->merge(BakePlan::LandCells(btr, id));
+				}
+			}
+			logger::info("bake: whole map: cells {},{} to {},{}: {} terrain LOD meshes, {} cells with land", minX, minY, maxX, maxY, meshes, cached->size());
+			const auto& mapData = world->worldMapData;
+			logger::info("bake: whole map: world map data (MNAM) usable {}x{}, NW cell {},{}, SE cell {},{} (not used)", mapData.usableWidth, mapData.usableHeight,
+				mapData.nwCellX, mapData.nwCellY, mapData.seCellX, mapData.seCellY);
+			const auto borders = BorderPolygons(world);
+			if (borders.empty()) {
+				logger::warn("bake: whole map: no border region for {}; every cell with land inside the worldspace bounds is photographed", kRootWorld);
+				return *cached;
+			}
+			const std::size_t landCells = cached->size();
+			*cached = BakePlan::ClipToBorders(*cached, borders);
+			logger::info("bake: whole map: {} of {} cells with land are inside the map border ({} border polygons)", cached->size(), landCells, borders.size());
+			return *cached;
+		}
+
 		std::vector<Shot> BuildShots(const std::vector<Marker>& a_markers, int a_grid)
 		{
 			std::map<std::string, std::set<std::pair<int, int>>> city;
 			std::set<std::pair<int, int>>                        tam;
-			const float scale = Settings::Get()->bake.areaScale;  // player option: photograph a wider area around each marker
+			const auto  cfg = Settings::Get();
+			const float scale = cfg->bake.areaScale;  // player option: photograph a wider area around each marker
 			for (const auto& m : a_markers) {
 				float r = RadiusFor(m.type) * scale;
 				if (IsCityWorld(m.world)) {
 					r = std::max(r, kCityMinRadius * scale);
 					CellsNear(m.x, m.y, r, city[m.world]);
-				} else if (m.world == kRootWorld && r > 0.0f) {
+				} else if (m.world == kRootWorld && r > 0.0f && !cfg->bake.fullMap) {
 					CellsNear(m.x, m.y, r, tam);
 				}
 			}
+			if (cfg->bake.fullMap)
+				tam = FullMapCells();
 			std::vector<Shot>             shots;
 			std::set<std::pair<int, int>> cityCells;  // filled from the city photos; Tamriel shows sky there
 			auto                          add = [&](const std::string& a_world, int a_bx, int a_by) {
@@ -304,6 +396,7 @@ namespace MM::Bake
 		};
 
 		fs::path TilePath(int a_cx, int a_cy) { return fs::path(kTileDir) / std::format("{}.{}.dds", a_cx, a_cy); }
+		fs::path MasterPath(int a_cx, int a_cy) { return fs::path(kMasterDir) / std::format("{}.{}.bmp", a_cx, a_cy); }
 
 		// ---------------------------------------------------------------- progress file
 
@@ -339,6 +432,18 @@ namespace MM::Bake
 			fs::rename(tmp, kProgressPath, ec);
 			if (ec)
 				logger::warn("bake: could not save progress: {}", ec.message());
+		}
+
+		// After every photo: one line added, not the whole file (10000 lines in a whole-map bake) rewritten.
+		// SaveProgress rewrites it whole at the start, when the colour match is decided and at the end.
+		void AppendProgress(const std::string& a_key)
+		{
+			std::ofstream out(kProgressPath, std::ios::app);
+			if (!out) {
+				logger::warn("bake: could not add {} to the progress file", a_key);
+				return;
+			}
+			BakePlan::AppendDone(out, a_key);
 		}
 
 		// ---------------------------------------------------------------- render thread: captures and reference renders
@@ -392,6 +497,18 @@ namespace MM::Bake
 		{
 			auto* r = RE::BSGraphics::Renderer::GetSingleton();
 			return r ? reinterpret_cast<ID3D11Device*>(r->GetRuntimeData().forwarder) : nullptr;
+		}
+
+		// The swap chain's back buffer size, read straight from the renderer (the same swap chain the hooks use).
+		void ReadScreenSize()
+		{
+			auto* r = RE::BSGraphics::Renderer::GetSingleton();
+			auto* swap = r ? reinterpret_cast<IDXGISwapChain*>(r->GetRuntimeData().renderWindows[0].swapChain) : nullptr;
+			DXGI_SWAP_CHAIN_DESC d{};
+			if (!swap || FAILED(swap->GetDesc(&d)))
+				return;
+			screenW = static_cast<int>(d.BufferDesc.Width);
+			screenH = static_cast<int>(d.BufferDesc.Height);
 		}
 
 		std::size_t BytesPerPixel(DXGI_FORMAT a_f)
@@ -538,11 +655,16 @@ namespace MM::Bake
 			ID3D11Device* device{ nullptr };
 			ShadeParams   shade;
 			int           grid{ BakePlan::kDefaultGrid };
+			int           tileSize{ BakeImage::kDefaultTileSize };
+			bool          saveMasters{ false };
 		};
 		struct ContrastJob
 		{
 			std::shared_ptr<Photo>              photo;
 			std::shared_ptr<std::promise<float>> result;
+			// Shot photos only: the block, and the terrain LOD reference's contrast (set to -1 when not needed or not known).
+			std::optional<std::pair<int, int>>   block;
+			std::shared_ptr<std::promise<float>> reference;
 		};
 		struct ShotJob
 		{
@@ -606,9 +728,14 @@ namespace MM::Bake
 		ID3D11Device*                                                              wDevice = nullptr;
 		ShadeParams                                                                wShade;
 		int                                                                        wGrid = BakePlan::kDefaultGrid;
+		int                                                                        wTileSize = BakeImage::kDefaultTileSize;
+		bool                                                                       wSaveMasters = false;
+		bool                                                                       wBegun = false;  // a BeginJob ran and its progress is not yet saved whole at the end
 		std::vector<PendingShot>                                                   wPending;
 		std::vector<std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>>> wSamples;
 		int                                                                        wSampledShots = 0;
+		double                                                                     wClippedSum = 0;   // clipped white share summed over this run's photos
+		int                                                                        wClippedShots = 0;
 
 		std::optional<std::vector<std::uint8_t>> RenderReference(int a_bx, int a_by)
 		{
@@ -651,37 +778,67 @@ namespace MM::Bake
 				return;
 			for (const auto& [cell, rgb] : a_shot.tiles) {
 				const int dx = cell.first - a_bx, dy = cell.second - a_by;
-				wSamples.emplace_back(BakeImage::BoxDown(rgb, BakeImage::kTileSize, BakeImage::kSampleSize), BakeImage::ReferenceCell(*ref, wGrid, dx, dy));
+				wSamples.emplace_back(BakeImage::BoxDown(rgb, wTileSize, BakeImage::kSampleSize), BakeImage::ReferenceCell(*ref, wGrid, dx, dy));
 			}
+		}
+
+		// Contrast of the block's terrain LOD reference render; -1 without one.
+		float ReferenceContrastOf(int a_bx, int a_by)
+		{
+			const auto ref = RenderReference(a_bx, a_by);
+			return ref ? BakeImage::ReferenceContrast(*ref, BakeImage::ReferenceSize(wGrid)) : -1.0f;
+		}
+
+		// Written next to the target and renamed, so nothing (the minimap, the Photo Baker app) ever reads half a file.
+		bool WriteFileWhole(const fs::path& a_path, std::span<const std::uint8_t> a_bytes)
+		{
+			const auto tmp = fs::path(a_path).concat(".tmp");
+			{
+				std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+				out.write(reinterpret_cast<const char*>(a_bytes.data()), static_cast<std::streamsize>(a_bytes.size()));
+				if (!out) {
+					logger::error("bake: could not write {}", tmp.string());
+					return false;
+				}
+			}
+			std::error_code ec;
+			fs::rename(tmp, a_path, ec);
+			if (ec) {
+				logger::error("bake: could not write {}: {}", a_path.string(), ec.message());
+				return false;
+			}
+			return true;
 		}
 
 		void WriteShot(PendingShot& a_shot)
 		{
 			std::error_code ec;
 			fs::create_directories(kTileDir, ec);
+			if (wSaveMasters)
+				fs::create_directories(kMasterDir, ec);
 			for (auto& [cell, rgb] : a_shot.tiles) {
+				// Masters untoned: the Photo Baker app applies tone.txt to them, as ApplyTone does here for the BC1 tile.
+				if (wSaveMasters)
+					WriteFileWhole(MasterPath(cell.first, cell.second), BakeImage::EncodeBmp24(rgb, wTileSize, wTileSize));
 				BakeImage::ApplyTone(wProgress.tone, rgb);
-				const auto dds = BakeImage::EncodeDdsBc1(rgb, BakeImage::kTileSize);
-				const auto path = TilePath(cell.first, cell.second);
-				const auto tmp = fs::path(path).concat(".tmp");
-				{
-					std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-					out.write(reinterpret_cast<const char*>(dds.data()), static_cast<std::streamsize>(dds.size()));
-					if (!out) {
-						logger::error("bake: could not write {}", tmp.string());
-						continue;
-					}
-				}
-				// Written next to the target and renamed, so the minimap never reads half a file.
-				fs::rename(tmp, path, ec);
-				if (ec) {
-					logger::error("bake: could not write {}: {}", path.string(), ec.message());
-					continue;
-				}
-				Minimap::ForgetBakedTile(cell.first, cell.second);
+				if (WriteFileWhole(TilePath(cell.first, cell.second), BakeImage::EncodeDdsBc1(rgb, wTileSize)))
+					Minimap::ForgetBakedTile(cell.first, cell.second);
 			}
 			wProgress.done.insert(a_shot.key);
-			SaveProgress(wProgress);
+			AppendProgress(a_shot.key);
+		}
+
+		// Masters only: the tone the BC1 tiles got, whenever it is decided or taken over from an earlier run.
+		void WriteToneFile(const BakeImage::Tone& a_tone)
+		{
+			if (!wSaveMasters)
+				return;
+			std::ostringstream text;
+			BakePlan::WriteToneText(text, a_tone);
+			const std::string bytes = text.str();
+			std::error_code   ec;
+			fs::create_directories(kMasterDir, ec);
+			WriteFileWhole(fs::path(kMasterDir) / kToneFile, { reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size() });
 		}
 
 		void DecideTone()
@@ -701,12 +858,24 @@ namespace MM::Bake
 				SetTone("fixed tone curve (no terrain LOD to match)");
 			}
 			wSamples.clear();
+			SaveProgress(wProgress);  // whole: the tone lines change
+			WriteToneFile(wProgress.tone);
 			for (auto& p : wPending)
 				WriteShot(p);
 			wPending.clear();
 		}
 
 		void DumpPhoto(const BakeImage::RgbImage& a_img, const std::string& a_key);
+
+		// Blown-out white in the raw photos (before the colour match): per photo at debug level, an average every few photos.
+		void LogHighlights(const BakeImage::RgbImage& a_img, const std::string& a_key)
+		{
+			const float clipped = BakeImage::ClippedWhiteFraction(a_img);
+			logger::debug("bake: photo {} clipped white {:.1f}%", a_key, clipped * 100.0f);
+			wClippedSum += clipped;
+			if (++wClippedShots % kHighlightLogEvery == 0)
+				logger::info("bake: {} photos this run, clipped white {:.1f}% average", wClippedShots, wClippedSum / wClippedShots * 100.0);
+		}
 
 		void RunJob(Job& a_job)
 		{
@@ -715,9 +884,17 @@ namespace MM::Bake
 				wDevice = b->device;
 				wShade = b->shade;
 				wGrid = b->grid;
+				wTileSize = b->tileSize;
+				wSaveMasters = b->saveMasters;
 				wPending.clear();
 				wSamples.clear();
 				wSampledShots = 0;
+				wClippedSum = 0;
+				wClippedShots = 0;
+				wBegun = true;
+				SaveProgress(wProgress);  // whole, with the grid line, before any shot is appended
+				if (wProgress.toneKnown)
+					WriteToneFile(wProgress.tone);
 				SetTone(wProgress.toneKnown ? (wProgress.tone.fitted ? "colour match from the earlier run" : "fixed tone curve (earlier run)") : "sampling the first photos");
 			} else if (auto* c = std::get_if<ContrastJob>(&a_job)) {
 				BakeImage::RgbImage img;
@@ -725,6 +902,8 @@ namespace MM::Bake
 				if (BakeImage::ConvertPhoto(c->photo->bytes.data(), c->photo->w, c->photo->h, c->photo->pitch, c->photo->format, img))
 					v = BakeImage::CentreContrast(img);
 				c->result->set_value(v);
+				if (c->reference)
+					c->reference->set_value(c->block && BakeImage::NeedsReferenceContrast(v) ? ReferenceContrastOf(c->block->first, c->block->second) : -1.0f);
 			} else if (auto* s = std::get_if<ShotJob>(&a_job)) {
 				BakeImage::RgbImage img;
 				if (!BakeImage::ConvertPhoto(s->photo->bytes.data(), s->photo->w, s->photo->h, s->photo->pitch, s->photo->format, img)) {
@@ -732,11 +911,12 @@ namespace MM::Bake
 					return;
 				}
 				s->photo.reset();  // the raw copy is not needed any more
+				LogHighlights(img, s->key);
 				if (Settings::Get()->debugLog)
 					DumpPhoto(img, s->key);
 				PendingShot shot{ s->key, {} };
 				for (const auto& cell : s->cells)
-					shot.tiles.push_back({ cell, BakeImage::CropCell(img, s->fov, s->grid, cell.first - s->bx, cell.second - s->by) });
+					shot.tiles.push_back({ cell, BakeImage::CropCell(img, s->fov, s->grid, cell.first - s->bx, cell.second - s->by, wTileSize) });
 				if (wProgress.toneKnown) {
 					WriteShot(shot);
 					return;
@@ -753,6 +933,8 @@ namespace MM::Bake
 			} else if (std::holds_alternative<FlushJob>(a_job)) {
 				if (!wProgress.toneKnown && !wPending.empty())
 					DecideTone();
+				if (std::exchange(wBegun, false))
+					SaveProgress(wProgress);  // whole again: folds the appended lines in
 			}
 		}
 
@@ -762,25 +944,15 @@ namespace MM::Bake
 			const std::filesystem::path dir = "Data/SKSE/Plugins/ModernMinimapBakeDebug";
 			std::error_code             ec;
 			std::filesystem::create_directories(dir, ec);
-			const int w = a_img.w / 4, h = a_img.h / 4, row = (w * 3 + 3) & ~3;
-			std::vector<std::uint8_t> out(54 + static_cast<std::size_t>(row) * h, 0);
-			auto put32 = [&](std::size_t o, std::uint32_t v) { std::memcpy(out.data() + o, &v, 4); };
-			out[0] = 'B';
-			out[1] = 'M';
-			put32(2, static_cast<std::uint32_t>(out.size()));
-			put32(10, 54);
-			put32(14, 40);
-			put32(18, static_cast<std::uint32_t>(w));
-			put32(22, static_cast<std::uint32_t>(h));
-			out[26] = 1;
-			out[28] = 24;
+			const int                 w = a_img.w / 4, h = a_img.h / 4;
+			std::vector<std::uint8_t> rgb(static_cast<std::size_t>(w) * h * 3);
 			for (int y = 0; y < h; ++y)
 				for (int x = 0; x < w; ++x) {
 					const float* c = &a_img.px[(static_cast<std::size_t>(y * 4) * a_img.w + x * 4) * 3];
-					auto* d = &out[54 + static_cast<std::size_t>(h - 1 - y) * row + x * 3];
 					for (int k = 0; k < 3; ++k)
-						d[2 - k] = static_cast<std::uint8_t>(std::clamp(c[k], 0.0f, 255.0f) + 0.5f);
+						rgb[(static_cast<std::size_t>(y) * w + x) * 3 + k] = static_cast<std::uint8_t>(std::clamp(c[k], 0.0f, 255.0f) + 0.5f);
 				}
+			const auto  out = BakeImage::EncodeBmp24(rgb, w, h);
 			std::string name = a_key;
 			std::ranges::replace(name, ' ', '_');
 			std::ofstream(dir / (name + ".bmp"), std::ios::binary).write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
@@ -805,9 +977,12 @@ namespace MM::Bake
 					logger::error("bake: worker job failed");
 				}
 				if (auto* c = std::get_if<ContrastJob>(&job)) {
-					try {
-						c->result->set_value(-1.0f);  // throws if already set; only matters when the job failed early
-					} catch (...) {
+					for (const auto& promise : { c->result, c->reference }) {
+						try {
+							if (promise)
+								promise->set_value(-1.0f);  // throws if already set; only matters when the job failed early
+						} catch (...) {
+						}
 					}
 				}
 				--jobsOpen;
@@ -834,6 +1009,21 @@ namespace MM::Bake
 			return future;
 		}
 
+		// A shot photo's contrast plus, when it is low, its block reference's contrast.
+		struct ShotContrast
+		{
+			std::shared_future<float> photo;
+			std::shared_future<float> reference;
+		};
+		ShotContrast SubmitShotContrast(std::shared_ptr<Photo> a_photo, int a_bx, int a_by)
+		{
+			auto photoPromise = std::make_shared<std::promise<float>>();
+			auto referencePromise = std::make_shared<std::promise<float>>();
+			ShotContrast futures{ photoPromise->get_future().share(), referencePromise->get_future().share() };
+			Submit(ContrastJob{ std::move(a_photo), std::move(photoPromise), std::pair{ a_bx, a_by }, std::move(referencePromise) });
+			return futures;
+		}
+
 		// ---------------------------------------------------------------- main thread: the bake itself
 
 		enum class Phase
@@ -857,7 +1047,8 @@ namespace MM::Bake
 		{
 			kShot,
 			kFogA,
-			kFogB
+			kFogB,
+			kSettleLook  // adaptive settle: a thumbnail to compare with the last one, no photo
 		};
 
 		enum class CamMode
@@ -874,8 +1065,10 @@ namespace MM::Bake
 		// Main thread only.
 		Phase             phase = Phase::kIdle;
 		std::shared_ptr<Photo>    checkPhoto;     // kShotCheck: the photo waiting for its contrast check
-		std::shared_future<float> checkContrast;
+		ShotContrast              checkContrast;
 		bool                      flatRetried = false;  // this shot already got a new fog test after a flat photo
+		bool                      detailChecked = false;  // the photo px per cell warning was decided at the first capture
+		int                       runTileSize = BakeImage::kDefaultTileSize;  // tile side of the running bake, taken at Start
 		CapPurpose        capPurpose = CapPurpose::kShot;
 		CamMode           camMode = CamMode::kNone;
 		float             cameraWait = 0.0f;  // extra seconds spent waiting for the camera to reach the shot
@@ -902,6 +1095,28 @@ namespace MM::Bake
 		int               capturedThisRun = 0;
 		int               doneBefore = 0;
 		int               remainingAtStart = 0;
+
+		// Adaptive settle.
+		BakePlan::SettleRule settleRule;          // taken at Start
+		float                settleElapsed = 0;   // unpaused seconds since the camera was sent to the shot
+		float                lookWait = 0;        // seconds to the next look
+		std::vector<float>   lastLook;            // the last look's luma thumbnail
+		std::vector<float>   lookDiffs;           // changes between consecutive looks, oldest first
+		double               settleTotal = 0;     // settle seconds summed over this run's photos
+		int                  settledShots = 0;
+
+		// Spread colour fit, planned restarts, retry pass (taken at Start).
+		bool                spreadFit = false;     // move a spread sample of the shots to the front for the colour match
+		bool                restartAllowed = false;  // Photo Baker app run: planned restarts may quit the game
+		int                 restartEvery = 0;
+		bool                retryFailed = true;
+		BakePlan::RetryBook retryBook;             // indices into shots
+		int                 retryCellsLeft = 0;    // retry pass: cells of the retry shots not tried yet
+
+		// [Bake] bLockExposure: image spaces whose eye adaptation strength was set to 0, with the original value.
+		std::vector<std::pair<RE::TESImageSpace*, float>> lockedEyeAdapt;
+		// [Bake] fPhotoExposure: image spaces whose brightness was scaled down, with the original value.
+		std::vector<std::pair<RE::TESImageSpace*, float>> scaledBrightness;
 
 		// Ground heights are read on a helper thread at start (a few hundred LOD meshes).
 		std::atomic<bool>  prepDone{ false };
@@ -946,8 +1161,9 @@ namespace MM::Bake
 			std::string  state = s.state;
 			if (state.empty())
 				state = (phase == Phase::kFinishing || (!s.running && s.writing)) ? "writing" : "running";
-			const auto text = std::format("{{\"state\": {}, \"found\": {}, \"done\": {}, \"etaSeconds\": {:.0f}, \"phase\": {}, \"message\": {}, \"pid\": {}}}\n",
-				JsonText(state), s.found, s.done, s.etaSeconds, JsonText(s.phase), JsonText(s.message), GetCurrentProcessId());
+			const auto text = std::format(
+				"{{\"state\": {}, \"found\": {}, \"done\": {}, \"doneCount\": {}, \"failedCells\": {}, \"etaSeconds\": {:.0f}, \"phase\": {}, \"message\": {}, \"pid\": {}}}\n",
+				JsonText(state), s.found, s.done, s.done, s.failedCells, s.etaSeconds, JsonText(s.phase), JsonText(s.message), GetCurrentProcessId());
 			std::error_code ec;
 			fs::create_directories(fs::path(kStatusPath).parent_path(), ec);
 			// Temp file and rename: the app polls this file and must never read half of it.
@@ -1249,6 +1465,62 @@ namespace MM::Bake
 			Minimap::SetSuppressed(false);
 		}
 
+		// Eye adaptation would brighten dark spots and darken bright ones from photo to photo. Strength 0 in every
+		// image space record (the HDR data the weather and cell lighting blend from) keeps the exposure fixed.
+		// Form data only, never saved in the game; restored when the bake ends, and gone anyway when the game quits.
+		void LockExposure()
+		{
+			auto* dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!lockedEyeAdapt.empty() || !dataHandler)
+				return;
+			for (auto* space : dataHandler->GetFormArray<RE::TESImageSpace>()) {
+				if (!space || space->data.hdr.eyeAdaptStrength == 0.0f)
+					continue;
+				lockedEyeAdapt.emplace_back(space, space->data.hdr.eyeAdaptStrength);
+				space->data.hdr.eyeAdaptStrength = 0.0f;
+			}
+			logger::info("bake: eye adaptation off in {} image spaces", lockedEyeAdapt.size());
+		}
+
+		void UnlockExposure()
+		{
+			if (lockedEyeAdapt.empty())
+				return;
+			for (const auto& [space, strength] : lockedEyeAdapt)
+				space->data.hdr.eyeAdaptStrength = strength;
+			logger::info("bake: eye adaptation restored in {} image spaces", lockedEyeAdapt.size());
+			lockedEyeAdapt.clear();
+		}
+
+		// Snow at noon in clear weather comes out pure white even after eye adaptation has settled. The image space
+		// brightness is applied after adaptation and tone mapping, so scaling it down keeps the bright ground below
+		// white; the colour match brightens the photos back. Form data only, restored when the bake ends.
+		void ScaleExposure(float a_factor)
+		{
+			auto* dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!scaledBrightness.empty() || !dataHandler || a_factor >= 1.0f)
+				return;
+			for (auto* space : dataHandler->GetFormArray<RE::TESImageSpace>()) {
+				if (!space)
+					continue;
+				scaledBrightness.emplace_back(space, space->data.cinematic.brightness);
+				space->data.cinematic.brightness *= a_factor;
+			}
+			logger::info("bake: picture brightness x{:.2f} in {} image spaces", a_factor, scaledBrightness.size());
+		}
+
+		void RestoreExposure()
+		{
+			if (scaledBrightness.empty())
+				return;
+			for (const auto& [space, brightness] : scaledBrightness)
+				space->data.cinematic.brightness = brightness;
+			logger::info("bake: picture brightness restored in {} image spaces", scaledBrightness.size());
+			scaledBrightness.clear();
+		}
+
+		double AverageSettle() { return settledShots > 0 ? settleTotal / settledShots : 0.0; }
+
 		void UpdateCounts()
 		{
 			{
@@ -1280,9 +1552,16 @@ namespace MM::Bake
 			running = false;
 			cancelRequested = false;
 			Submit(FlushJob{});
-			if (actorsHidden || Settings::BakeHideActorsRequested())
-				Settings::SetBakeHideActors(false);
-			Settings::ClearBakeStartOnLoad();
+			UnlockExposure();
+			RestoreExposure();
+			if (settledShots > 0)
+				logger::info("bake: {} photos this run, average settle {:.1f} s", settledShots, AverageSettle());
+			// A planned restart keeps the start keys (and hidden NPCs): the next game start carries on with the bake.
+			if (std::string_view(a_state) != kRestartState) {
+				if (actorsHidden || Settings::BakeHideActorsRequested())
+					Settings::SetBakeHideActors(false);
+				Settings::ClearBakeStartOnLoad();
+			}
 			// With bQuitWhenDone (the Photo Baker app) the game quits by itself: no advice about the camera or NPCs.
 			std::string msg = a_msg;
 			if (!quitWhenDone) {
@@ -1301,14 +1580,71 @@ namespace MM::Bake
 				RE::DebugMessageBox(("Modern Minimap: " + msg).c_str());
 		}
 
+		void BeginSettle()
+		{
+			settleElapsed = 0.0f;
+			lookWait = 0.0f;
+			lastLook.clear();
+			lookDiffs.clear();
+			phase = Phase::kSettle;
+		}
+
+		// Adaptive settle: a look at the screen every kLookInterval once the camera is over the shot.
+		void LookIfDue(float a_dt)
+		{
+			if (!settleRule.adaptive || (lookWait -= a_dt) > 0.0f || !CameraAtTarget(false))
+				return;
+			lookWait = kLookInterval;
+			BeginCapture(CapPurpose::kSettleLook);
+		}
+
+		void AddLook(const std::shared_ptr<Photo>& a_photo)
+		{
+			if (!a_photo)
+				return;
+			auto look = BakeImage::LumaThumbnail(a_photo->bytes.data(), a_photo->w, a_photo->h, a_photo->pitch, a_photo->format, kLookSize);
+			if (look.empty())
+				return;
+			if (!lastLook.empty()) {
+				lookDiffs.push_back(BakeImage::MeanAbsDiff(lastLook, look));
+				logger::debug("bake: settle look at {:.1f} s: change {:.2f}", settleElapsed, lookDiffs.back());
+			}
+			lastLook = std::move(look);
+		}
+
+		// A failed photo: taken again in the retry pass at the end (or on the next run), else named as missing.
+		// Status failedCells: before the retry pass, the cells of the failed shots; during it, the cells still to be
+		// tried again, counted down after every retry shot whatever its outcome (so the Photo Baker app sees the bake
+		// moving); after it, the cells still missing (WriteMissingList).
+		void CountRetryShot()
+		{
+			if (!retryBook.InRetry())
+				return;
+			retryCellsLeft = std::max(0, retryCellsLeft - static_cast<int>(shots[cur].cells.size()));
+			std::lock_guard lock(statusMutex);
+			status.failedCells = retryCellsLeft;
+		}
+
+		void MarkFailed()
+		{
+			const bool inRetry = retryBook.InRetry();
+			retryBook.Fail(cur, static_cast<int>(shots[cur].cells.size()));
+			if (inRetry) {
+				CountRetryShot();
+			} else {
+				std::lock_guard lock(statusMutex);
+				status.failedCells = retryBook.FailedCells();
+			}
+			WriteStatusFile();
+		}
+
 		void StartShot(const Shot& a_s)
 		{
 			MovePlayer(a_s);
 			AimAt(a_s);
 			if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->IsInFreeCameraMode())
 				Console(std::format("fov {:.4f}", fov));
-			waitLeft = settle;
-			phase = Phase::kSettle;
+			BeginSettle();
 			SetPhase(std::format("settling at {} {},{}", a_s.world, a_s.bx, a_s.by));
 		}
 
@@ -1321,33 +1657,126 @@ namespace MM::Bake
 			shots[cur].done = true;
 			reentering = false;
 			flatRetried = false;
+			CountRetryShot();
 			UpdateCounts();
+			if (settledShots > 0 && settledShots % kSettleLogEvery == 0)
+				logger::info("bake: {} photos this run, {} done of {}, average settle {:.1f} s", capturedThisRun, doneBefore + capturedThisRun, shots.size(), AverageSettle());
 			++cur;
 			phase = Phase::kNext;
 		}
 
-		// A nearly flat photo (one colour): the fog came back on, or something covers the spot. Test the fog again
-		// and take the photo once more; if it is still flat, save nothing for it.
+		// Spread colour fit: the colour match is fitted from the first photos taken, so take a sample spread over
+		// the whole list first (a whole-map list starts in the snowy north). Tamriel shots only: the walled cities
+		// are few and would add a worldspace change each.
+		void MoveSpreadShotsFirst()
+		{
+			std::vector<std::size_t>            candidates;
+			std::vector<std::pair<float, float>> points;
+			for (std::size_t i = 0; i < shots.size(); ++i) {
+				if (shots[i].done || shots[i].world != kRootWorld)
+					continue;
+				candidates.push_back(i);
+				points.emplace_back(shots[i].x, shots[i].y);
+			}
+			const auto picks = BakePlan::SpreadSample(points, kFitShots);
+			if (picks.empty())
+				return;
+			std::vector<bool> picked(shots.size(), false);
+			std::vector<Shot> ordered;
+			ordered.reserve(shots.size());
+			for (const auto pick : picks) {
+				picked[candidates[pick]] = true;
+				ordered.push_back(shots[candidates[pick]]);
+			}
+			for (std::size_t i = 0; i < shots.size(); ++i)
+				if (!picked[i])
+					ordered.push_back(std::move(shots[i]));
+			shots = std::move(ordered);
+			logger::info("bake: colour match from {} photos spread over the map, taken first", picks.size());
+		}
+
+		// End of the list: failed shots once more, appended to the list. False when there is nothing (left) to retry.
+		bool QueueRetryPass()
+		{
+			const auto again = retryBook.StartRetry();
+			retryCellsLeft = 0;
+			for (const auto idx : again) {
+				Shot copy = shots[idx];
+				copy.done = false;
+				retryCellsLeft += static_cast<int>(copy.cells.size());
+				shots.push_back(std::move(copy));
+			}
+			{
+				std::lock_guard lock(statusMutex);
+				status.failedCells = retryCellsLeft;
+			}
+			if (again.empty())
+				return false;
+			curWorld.clear();  // the retry pass starts with a fresh entry and fog test
+			havePrev = false;
+			logger::info("bake: taking {} failed photos once more", again.size());
+			SetPhase(std::format("taking {} failed photos once more", again.size()));
+			return true;
+		}
+
+		// Cells still without a photo: named in the log and in kMissingPath (removed when there are none).
+		void WriteMissingList()
+		{
+			std::vector<std::string> keys;
+			for (const auto idx : retryBook.Failed())
+				for (const auto& [cx, cy] : shots[idx].cells)
+					keys.push_back(ShotKey(shots[idx].world, cx, cy));
+			{
+				std::lock_guard lock(statusMutex);
+				status.failedCells = static_cast<int>(keys.size());
+			}
+			std::error_code ec;
+			if (keys.empty()) {
+				fs::remove(kMissingPath, ec);
+				return;
+			}
+			std::ostringstream text;
+			BakePlan::WriteMissing(text, keys);
+			const std::string bytes = text.str();
+			WriteFileWhole(kMissingPath, { reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size() });
+			logger::warn("bake: {} cells still have no photo (listed in {}):", keys.size(), kMissingPath);
+			for (const auto& key : keys)
+				logger::warn("bake:   missing {}", key);
+		}
+
+		// A nearly flat photo (one colour): the fog came back on, or something covers the spot. Plain snow or ice
+		// is low-contrast too, so a low photo is compared with the block's terrain LOD reference first. Test the fog
+		// again and take the photo once more; if it is still flat (or clearly empty from the start), save nothing for it.
 		void CheckShot()
 		{
-			if (checkContrast.valid() && checkContrast.wait_for(0s) != std::future_status::ready)
+			const auto ready = [](const std::shared_future<float>& f) { return !f.valid() || f.wait_for(0s) == std::future_status::ready; };
+			if (!ready(checkContrast.photo) || !ready(checkContrast.reference))
 				return;
-			const float contrast = checkContrast.valid() ? checkContrast.get() : -1.0f;
+			const float contrast = checkContrast.photo.valid() ? checkContrast.photo.get() : -1.0f;
+			const float reference = checkContrast.reference.valid() ? checkContrast.reference.get() : -1.0f;
 			checkContrast = {};
-			if (contrast >= 0.0f && contrast < kFlatContrast && flatRetried) {
-				// Flat again after a new fog test: something covers this spot. No tile is better than a grey one:
-				// the minimap shows the player's terrain there.
+			const auto verdict = BakeImage::JudgeContrast(contrast, reference);
+			const bool clearlyEmpty = verdict == BakeImage::ContrastVerdict::kEmpty && contrast < BakeImage::kClearlyEmptyContrast;
+			if (verdict != BakeImage::ContrastVerdict::kKeep && (flatRetried || clearlyEmpty)) {
+				// Flat again after a new fog test, or nothing at all there (sea, map edge): no tile is better than a
+				// grey one; the minimap shows the player's terrain there.
 				const Shot& s = shots[cur];
-				logger::warn("bake: photo at {} {},{} still flat (contrast {:.1f}); not saved, your terrain shows there", s.world, s.bx, s.by, contrast);
+				logger::warn("bake: photo at {} {},{} {} (contrast {:.1f}, reference {:.1f}); not saved, your terrain shows there", s.world, s.bx, s.by,
+					flatRetried ? "still flat" : "empty", contrast, reference);
 				checkPhoto.reset();
 				flatRetried = false;
+				MarkFailed();
 				++cur;
 				phase = Phase::kNext;
 				return;
 			}
-			if (contrast >= 0.0f && contrast < kFlatContrast) {
+			if (verdict == BakeImage::ContrastVerdict::kKeep && BakeImage::NeedsReferenceContrast(contrast)) {
 				const Shot& s = shots[cur];
-				logger::warn("bake: flat photo at {} {},{} (contrast {:.1f}); testing the fog again", s.world, s.bx, s.by, contrast);
+				logger::info("bake: low-contrast photo at {} {},{} kept: plain ground (contrast {:.1f}, reference {:.1f})", s.world, s.bx, s.by, contrast, reference);
+			}
+			if (verdict != BakeImage::ContrastVerdict::kKeep) {
+				const Shot& s = shots[cur];
+				logger::warn("bake: flat photo at {} {},{} (contrast {:.1f}, reference {:.1f}); testing the fog again", s.world, s.bx, s.by, contrast, reference);
 				checkPhoto.reset();
 				flatRetried = true;
 				waitLeft = 0.0f;
@@ -1358,8 +1787,22 @@ namespace MM::Bake
 			AcceptShot(std::move(checkPhoto));
 		}
 
+		// Once per run, at the first capture: the real back buffer size is known only now.
+		void CheckPhotoDetail(const Photo& a_photo)
+		{
+			if (std::exchange(detailChecked, true) || !BakeImage::TooFewPixelsPerCell(a_photo.w, fov, grid, runTileSize))
+				return;
+			const double cellPx = BakeImage::PhotoPixelsPerCell(a_photo.w, fov, grid);
+			logger::warn("bake: {:.0f} photo px per cell with the {} grid on this {}x{} screen, less than the {} px tiles: they are upscaled", cellPx, GridName(grid),
+				a_photo.w, a_photo.h, runTileSize);
+			SetMessage(std::format("Only {:.0f} photo px per cell for {} px tiles on this {}x{} screen: the tiles are upscaled. Use a smaller grid or tile size.", cellPx,
+				runTileSize, a_photo.w, a_photo.h));
+		}
+
 		void OnCaptured(std::shared_ptr<Photo> a_photo)
 		{
+			if (a_photo)
+				CheckPhotoDetail(*a_photo);
 			const Shot& s = shots[cur];
 			switch (capPurpose) {
 			case CapPurpose::kFogA:
@@ -1372,6 +1815,10 @@ namespace MM::Bake
 				fogB = a_photo ? SubmitContrast(std::move(a_photo)) : std::shared_future<float>{};
 				phase = Phase::kFogDecide;
 				break;
+			case CapPurpose::kSettleLook:
+				AddLook(a_photo);
+				phase = Phase::kSettle;
+				break;
 			case CapPurpose::kShot:
 				if (a_photo && Settings::Get()->debugLog) {
 					const auto pos = CameraPos();
@@ -1379,12 +1826,13 @@ namespace MM::Bake
 						pos ? pos->x : 0.0f, pos ? pos->y : 0.0f, pos ? pos->z : 0.0f);
 				}
 				if (!a_photo) {
-					logger::warn("bake: capture failed: {} {},{} (taken again on the next run)", s.world, s.bx, s.by);
+					logger::warn("bake: capture failed: {} {},{} (taken again in the retry pass)", s.world, s.bx, s.by);
+					MarkFailed();
 					++cur;
 					phase = Phase::kNext;
 					break;
 				}
-				checkContrast = SubmitContrast(a_photo);
+				checkContrast = SubmitShotContrast(a_photo, s.bx, s.by);
 				checkPhoto = std::move(a_photo);
 				phase = Phase::kShotCheck;
 				break;
@@ -1402,7 +1850,8 @@ namespace MM::Bake
 			reentering = true;
 			if (cur < shots.size()) {
 				const Shot& s = shots[cur];
-				logger::warn("bake: area at {} {},{} did not finish loading; photo skipped (tried again on the next run)", s.world, s.bx, s.by);
+				logger::warn("bake: area at {} {},{} did not finish loading; photo skipped (tried again in the retry pass)", s.world, s.bx, s.by);
+				MarkFailed();
 				++cur;
 			}
 			curWorld.clear();  // the next photo enters its worldspace again through a map marker
@@ -1421,6 +1870,8 @@ namespace MM::Bake
 				if (prepDone) {
 					std::lock_guard lock(prepMutex);
 					shots = std::move(prepShots);
+					if (spreadFit)
+						MoveSpreadShotsFirst();
 					cur = 0;
 					remainingAtStart = static_cast<int>(std::ranges::count_if(shots, [](const Shot& s) { return !s.done; }));
 					doneBefore = static_cast<int>(shots.size()) - remainingAtStart;
@@ -1433,9 +1884,16 @@ namespace MM::Bake
 					while (cur < shots.size() && shots[cur].done)
 						++cur;
 					if (cur >= shots.size()) {
+						if (retryFailed && QueueRetryPass())
+							return;  // the failed shots are now at the end of the list
+						WriteMissingList();
 						Submit(FlushJob{});
 						phase = Phase::kFinishing;
 						SetPhase("writing the last tiles");
+						return;
+					}
+					if (restartAllowed && BakePlan::RestartDue(capturedThisRun, restartEvery)) {
+						Stop(std::format("Planned restart after {} photos; the bake carries on when the game starts again.", capturedThisRun), kRestartState);
 						return;
 					}
 					const Shot& s = shots[cur];
@@ -1517,24 +1975,29 @@ namespace MM::Bake
 					} else {
 						logger::info("bake: fog: toggled ({:.2f} vs {:.2f})", b, a);
 					}
-					waitLeft = settle;
-					phase = Phase::kSettle;
+					BeginSettle();
 					return;
 				}
 			case Phase::kSettle:
-				if (waited) {
-					// Never photograph a spot the camera has not reached: wait up to kCameraTimeout more, then skip
-					// the shot (it is taken again on the next run) rather than write a wrong tile.
-					if (CameraAtTarget(cameraWait == 0.0f)) {
-						cameraWait = 0.0f;
-						BeginCapture(CapPurpose::kShot);
-					} else if ((cameraWait += a_dt) > kCameraTimeout) {
-						const Shot& s = shots[cur];
-						logger::warn("bake: camera never reached {} {},{}; skipped (taken again on the next run)", s.world, s.bx, s.by);
-						cameraWait = 0.0f;
-						++cur;
-						phase = Phase::kNext;
-					}
+				settleElapsed += a_dt;
+				if (!BakePlan::SettleDone(settleElapsed, lookDiffs, settleRule)) {
+					LookIfDue(a_dt);
+					return;
+				}
+				// Never photograph a spot the camera has not reached: wait up to kCameraTimeout more, then skip
+				// the shot (it is taken again in the retry pass) rather than write a wrong tile.
+				if (CameraAtTarget(cameraWait == 0.0f)) {
+					cameraWait = 0.0f;
+					settleTotal += settleElapsed;
+					++settledShots;
+					BeginCapture(CapPurpose::kShot);
+				} else if ((cameraWait += a_dt) > kCameraTimeout) {
+					const Shot& s = shots[cur];
+					logger::warn("bake: camera never reached {} {},{}; skipped (taken again in the retry pass)", s.world, s.bx, s.by);
+					cameraWait = 0.0f;
+					MarkFailed();
+					++cur;
+					phase = Phase::kNext;
 				}
 				return;
 			case Phase::kCapturing:
@@ -1635,7 +2098,8 @@ namespace MM::Bake
 			int        done = 0;
 			for (const auto& s : list)
 				done += progress.done.contains(ShotKey(s.world, s.bx, s.by)) ? 1 : 0;
-			logger::info("bake: {} map markers -> {} photos with the {} grid ({} done in earlier runs)", markers.size(), list.size(), GridName(scanGrid), done);
+			logger::info("bake: {} map markers -> {} photos with the {} grid{} ({} done in earlier runs)", markers.size(), list.size(), GridName(scanGrid),
+				Settings::Get()->bake.fullMap ? ", whole map" : "", done);
 			if (const auto note = DroppedGridNote(progress); !note.empty() && !running)
 				SetMessage(note);
 			std::lock_guard lock(statusMutex);
@@ -1663,7 +2127,7 @@ namespace MM::Bake
 			grid = BakePlan::ClampGrid(cfg->bake.photoGrid);
 			auto list = BuildShots(markers, grid);
 			if (list.empty()) {
-				FailUnattended("No settlement map markers found.");
+				FailUnattended(cfg->bake.fullMap ? "No land found for the whole map (no terrain LOD meshes for Tamriel?)." : "No settlement map markers found.");
 				return;
 			}
 			{
@@ -1676,11 +2140,31 @@ namespace MM::Bake
 			ID3D11Device*        device = Device();
 			// The worker creates the reference tile textures from its own thread; a single-threaded device forbids that.
 			const bool refsOk = device && !(device->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED);
-			Submit(BeginJob{ progress, refsOk ? device : nullptr, cfg->shade, grid });
+			const int tileSize = BakeImage::ClampTileSize(cfg->bake.tileSize);
+			Submit(BeginJob{ progress, refsOk ? device : nullptr, cfg->shade, grid, tileSize, cfg->bake.saveMasters });
 			settle = cfg->bake.settleSeconds;
+			settleRule = { cfg->bake.adaptiveSettle, cfg->bake.settleMinSeconds, cfg->bake.settleSeconds, cfg->bake.settleThreshold };
+			settleTotal = 0;
+			settledShots = 0;
+			spreadFit = cfg->bake.spreadToneFit && !progress.toneKnown;
+			restartAllowed = statusFileOn && quitWhenDone;  // never quit a game a player started the bake in by hand
+			restartEvery = cfg->bake.restartEvery;
+			retryFailed = cfg->bake.retryFailed;
+			retryBook = {};
+			retryCellsLeft = 0;
+			{
+				std::lock_guard lock(statusMutex);
+				status.failedCells = 0;
+			}
+			if (cfg->bake.lockExposure)
+				LockExposure();
+			ScaleExposure(BakeImage::ClampPhotoExposure(cfg->bake.photoExposure));
 			const bool keep = cfg->bake.keepExisting;
+			ReadScreenSize();  // the bake's Present hook (which keeps it current) is not installed yet on the first start
 			const int  w = screenW, h = screenH;
 			fov = w > 0 && h > 0 ? BakeImage::BakeFovDeg(w, h) : BakeImage::kBaseFovDeg;
+			runTileSize = tileSize;
+			detailChecked = false;  // the photo px per cell warning comes with the first capture
 
 			prepDone = false;
 			std::thread([list = std::move(list), done = progress.done, keep, runGrid = grid]() mutable {
@@ -1727,8 +2211,9 @@ namespace MM::Bake
 			phase = Phase::kPreparing;
 			running = true;
 			SetPhase("reading ground heights");
-			SetMessage(std::format("{}{}Started: {} photos ({} grid), FOV {:.2f}, settle {:.0f} s{}. Close this menu.", gridNote, gridNote.empty() ? "" : " ", count,
-				GridName(grid), fov, settle, actorsHidden ? ", NPCs hidden" : ""));
+			const std::string settleNote = settleRule.adaptive ? std::format("settle {:.1f} to {:.0f} s", settleRule.minSeconds, settle) : std::format("settle {:.0f} s", settle);
+			SetMessage(std::format("{}{}Started: {} photos ({} grid{}, {} px tiles), FOV {:.2f}, {}{}. Close this menu.", gridNote, gridNote.empty() ? "" : " ", count,
+				GridName(grid), cfg->bake.fullMap ? ", whole map" : "", tileSize, fov, settleNote, actorsHidden ? ", NPCs hidden" : ""));
 			QueueTick();  // the first step; the Present hook queues the rest
 		}
 	}

@@ -2,6 +2,7 @@
 
 #include "Minimap.h"
 
+#include "FogState.h"
 #include "IconData.h"
 #include "MapRenderer.h"
 #include "InteriorMap.h"
@@ -16,6 +17,7 @@ namespace MM::Minimap
 
 		std::atomic<std::uint32_t> zoomIndex{ 0 };
 		std::atomic<bool>          hidden{ false };
+		std::atomic<bool>          holdZoom{ false };    // hold-to-zoom-out key is down
 		std::atomic<bool>          suppressed{ false };  // town photo bake is taking a picture
 
 		std::mutex          forgetMutex;
@@ -49,6 +51,8 @@ namespace MM::Minimap
 			std::string             world;
 			std::vector<IconSource> icons;
 			std::shared_ptr<const NavMeshData> nav;  // interiors: the cell's navmesh (null = radar disc)
+			std::shared_ptr<const FogState::Mask> fog;  // fog of war mask (null = off)
+			std::shared_ptr<const std::vector<GlyphPlacement>> infoLine;  // clock / location text (null = none)
 		};
 		std::mutex snapMutex;
 		Snapshot   snapShared;  // guarded by snapMutex
@@ -103,6 +107,7 @@ namespace MM::Minimap
 		}
 
 		std::vector<IconInstance> iconInstances;  // reused every frame
+		std::uint32_t             fogUploaded = 0;  // render thread: fog mask generation in the texture
 
 		// Cost of our draw + timers, logged once a minute at debug level.
 		struct Perf
@@ -210,9 +215,12 @@ namespace MM::Minimap
 			return true;
 		}
 
-		constexpr float kBakedMaxUnitsPerPixel = 64.0f;  // baked tiles are 8 units/px; past this zoom the LOD terrain alone is enough
+		constexpr float kCompassGlyphPx = 17.0f;  // at 1080p, before the icon scale (the ink is about half the glyph cell)
 
-		void Compose(ID3D11DeviceContext* a_ctx, const Settings::Values& cfg, const std::string& a_world, Vec2 a_center, float a_upp, int a_lvl, int a_size)
+		constexpr float kBakedMaxUnitsPerPixel = 64.0f;  // baked tiles are 8 units/px at 512 px (4 at 1024); past this zoom the LOD terrain alone is enough
+
+		void Compose(ID3D11DeviceContext* a_ctx, const Settings::Values& cfg, const std::string& a_world, Vec2 a_center, float a_upp, int a_lvl, int a_size,
+			const FogParams& a_fog)
 		{
 			const float half = a_size * 0.5f * a_upp;
 			const Rect  view{ a_center.x - half, a_center.y - half, a_center.x + half, a_center.y + half };
@@ -241,7 +249,7 @@ namespace MM::Minimap
 			if (baked)
 				add(TilesInRect(view, kBakedLevel));
 
-			renderer.Compose(a_ctx, { a_center, a_upp, a_size, cfg.shade }, draws);
+			renderer.Compose(a_ctx, { a_center, a_upp, a_size, cfg.shade, a_fog }, draws);
 			cache->Trim(wanted);
 			composed = { true, a_world, a_center, a_upp, a_lvl, a_size, Settings::Generation() };
 		}
@@ -398,6 +406,58 @@ namespace MM::Minimap
 			return QuantizeZoom(z.factor);
 		}
 
+		// Clock / location line (main thread). Checked on a short timer, laid out again only when the text changes.
+		struct InfoLineState
+		{
+			double                                             nextCheck{ 0 };
+			std::uint32_t                                      gen{ 0 };  // settings generation of the text
+			std::string                                        text;
+			std::shared_ptr<const std::vector<GlyphPlacement>> glyphs;
+		} infoLine;
+
+		constexpr double kInfoLineInterval = 0.25;
+		constexpr float  kInfoGlyphPx = 18.0f;  // at 1080p, before the icon scale
+
+		std::string LocationName(RE::PlayerCharacter* a_player, RE::TESObjectCELL* a_cell)
+		{
+			const auto* loc = a_player->GetCurrentLocation();
+			const char* name = loc ? loc->GetFullName() : nullptr;
+			if ((!name || !*name) && a_cell && a_cell->IsInteriorCell())
+				name = a_cell->GetFullName();
+			return name ? std::string(name) : std::string{};
+		}
+
+		std::shared_ptr<const std::vector<GlyphPlacement>> InfoLine(const Settings::Values& a_cfg, RE::PlayerCharacter* a_player, RE::TESObjectCELL* a_cell, double a_now)
+		{
+			auto& st = infoLine;
+			if (!a_cfg.clock && !a_cfg.locationName) {
+				st.glyphs.reset();
+				st.text.clear();
+				return nullptr;
+			}
+			if (a_now < st.nextCheck && st.gen == Settings::Generation())
+				return st.glyphs;
+			st.nextCheck = a_now + kInfoLineInterval;
+			std::string text;
+			if (a_cfg.clock) {
+				const auto* calendar = RE::Calendar::GetSingleton();
+				text = FormatClock(calendar ? calendar->GetHour() : 0.0f, a_cfg.clock24h);
+			}
+			if (a_cfg.locationName) {
+				// A name with letters the glyph set lacks (non-Latin) is left out: the clock alone.
+				if (auto name = LocationName(a_player, a_cell); !name.empty() && AllCharsHaveGlyphs(name))
+					text += (text.empty() ? "" : "  ") + name;
+			}
+			if (text == st.text && st.gen == Settings::Generation())
+				return st.glyphs;
+			st.text = std::move(text);
+			st.gen = Settings::Generation();
+			auto glyphs = std::make_shared<std::vector<GlyphPlacement>>();
+			LayoutText(st.text, kInfoGlyphPx, TextAlign::kCenter, *glyphs);
+			st.glyphs = glyphs->empty() ? nullptr : std::move(glyphs);
+			return st.glyphs;
+		}
+
 		// Main thread, once per frame (queued from Draw): reads every game object the minimap needs.
 		void GameTick()
 		{
@@ -414,7 +474,8 @@ namespace MM::Minimap
 					navId = {};
 					navCurrent.reset();
 				}
-				if (!((s.interior && cfg.hideInInteriors) || (cfg.hideInKillCam && InKillCam(player)))) {
+				const bool hide = (s.interior && cfg.hideInInteriors) || (cfg.hideInKillCam && InKillCam(player)) || (cfg.hideInCombat && player->IsInCombat());
+				if (!hide) {
 					s.pos = player->GetPosition();
 					s.heading = player->GetAngleZ();
 					s.view = cfg.useCameraYaw ? CameraHeading(s.heading) : s.heading;
@@ -426,7 +487,11 @@ namespace MM::Minimap
 					const float zoomFactor = AutoZoomFactor(cfg, hasMap, s.pos, nowSec);
 					if (hasMap)
 						s.radius *= zoomFactor;
+					s.radius = HoldZoomRadius(s.radius, holdZoom && cfg.holdZoomKey != 0, cfg.holdZoomFactor);
 					IconData::Update(nowSec, cfg, player, s.radius);
+					s.infoLine = InfoLine(cfg, player, cell, nowSec);
+					if (hasMap)
+						s.fog = FogState::Update(nowSec, cfg, player, IconData::MapRootWorld(player->GetWorldspace()));
 					if (cfg.icons.enabled)
 						IconData::Collect(nowSec, s.icons);
 					if (s.interior) {
@@ -490,6 +555,8 @@ namespace MM::Minimap
 			snapRender.world = snapShared.world;
 			snapRender.icons.assign(snapShared.icons.begin(), snapShared.icons.end());
 			snapRender.nav = snapShared.nav;
+			snapRender.fog = snapShared.fog;
+			snapRender.infoLine = snapShared.infoLine;
 		}
 		const Snapshot& snap = snapRender;
 		if (!snap.visible)
@@ -593,12 +660,22 @@ namespace MM::Minimap
 
 			const int   lvl = ChooseLevel(upp);
 			const int   targetSize = ComposeTargetSize(static_cast<int>(size));
+			// Fog of war: upload the mask only when it changed (a block explored or the window moved), then redraw once.
+			FogParams fog;
+			bool      fogChanged = false;
+			if (snap.fog) {
+				if (snap.fog->generation != fogUploaded && renderer.SetFogMask(a_ctx, snap.fog->pixels, Fog::kMaskSize)) {
+					fogUploaded = snap.fog->generation;
+					fogChanged = true;
+				}
+				fog = { fogUploaded == snap.fog->generation, snap.fog->world, cfg.fogDarkness, cfg.fogInTowns };
+			}
 			const bool  must = !composed.valid || composed.navGen != 0 || composed.world != cache->World() || composed.upp != upp || composed.size != targetSize ||
-			                  composed.gen != Settings::Generation();
+			                  composed.gen != Settings::Generation() || fogChanged;
 			const float moved = composed.valid ? std::max(std::fabs(pos.x - composed.center.x), std::fabs(pos.y - composed.center.y)) / upp : 1e9f;
 			const auto  now = Clock::now();
 			if ((must || tilesArrived || moved >= 1.0f) && (must || now - lastCompose >= 33ms)) {
-				Compose(a_ctx, cfg, cache->World(), { pos.x, pos.y }, upp, lvl, targetSize);
+				Compose(a_ctx, cfg, cache->World(), { pos.x, pos.y }, upp, lvl, targetSize, fog);
 				lastCompose = now;
 				tilesArrived = false;
 				state.BindTargets(a_ctx);
@@ -623,6 +700,7 @@ namespace MM::Minimap
 		// Icons: the main thread gathered them into the snapshot; here they are only projected.
 		const bool icons = cfg.icons.enabled;
 		IconView   iv;
+		iconInstances.clear();
 		if (icons) {
 			op.arrowSize = 0.0f;  // the arrow is drawn as the last icon instead
 			iv.player = { pos.x, pos.y };
@@ -632,9 +710,28 @@ namespace MM::Minimap
 			iv.round = op.round;
 			iv.centerPx = { op.left + size * 0.5f, op.top + size * 0.5f };
 			iv.iconScale = scale * cfg.icons.scale;
-			iconInstances.clear();
+			AppendCompassLetters(iv, kCompassGlyphPx, cfg.icons.colors.compass, cfg.icons.colors.textOutline, cfg.icons.compassLetters, iconInstances);
 			BuildIconInstances(snap.icons, iv, iconInstances);
 			iconInstances.push_back(ArrowInstance(iv, std::max(7.0f, size * 0.045f) * 2.5f, op.arrowAngle, cfg.icons.colors.arrow));
+		}
+		if (snap.infoLine) {
+			// One line centred under the minimap (above it in the bottom corners), drawn whole (not masked).
+			const float k = scale * cfg.icons.scale;
+			const float glyph = kInfoGlyphPx * k;
+			// Outside compass letters sit in the first band past the rim: the line goes one letter further out.
+			const bool  lettersOutside = cfg.icons.enabled && cfg.icons.compassLetters == CompassMode::kOutside;
+			const float clearance = glyph * 0.6f + (lettersOutside ? kCompassGlyphPx * 1.2f * k + 2.0f : 0.0f);
+			const float lineY = bottom ? op.top - clearance : op.top + size + clearance;
+			for (const auto& g : *snap.infoLine) {
+				IconInstance inst;
+				inst.x = op.left + size * 0.5f + g.x * k;
+				inst.y = lineY;
+				inst.size = glyph;
+				inst.clip = 0.0f;
+				inst.uv = AtlasUv(g.shape);
+				inst.rgba = cfg.icons.colors.infoText;
+				AppendOutlinedGlyph(inst, cfg.icons.colors.textOutline, iconInstances);
+			}
 		}
 
 		if (a_target) {
@@ -643,8 +740,10 @@ namespace MM::Minimap
 			a_ctx->RSSetViewports(1, &vp);
 		}
 		renderer.DrawOverlay(a_ctx, op);
-		if (icons)
-			renderer.DrawIcons(a_ctx, { W, H, iv.centerPx, size, op.round, cfg.opacity, op.linearOut, op.outScale }, iconInstances);
+		if (!iconInstances.empty()) {
+			const Vec2 centre{ op.left + size * 0.5f, op.top + size * 0.5f };
+			renderer.DrawIcons(a_ctx, { W, H, centre, size, op.round, cfg.opacity, op.linearOut, op.outScale }, iconInstances);
+		}
 		state.Restore(a_ctx);
 		PerfFrame(begin);
 	}
@@ -657,6 +756,8 @@ namespace MM::Minimap
 		zoomIndex = next;
 		logger::info("zoom step {} ({} units)", next, cfg->zoomRadii[next]);
 	}
+
+	void SetHoldZoom(bool a_held) { holdZoom = a_held; }
 
 	void SetMainThread()
 	{
